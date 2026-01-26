@@ -21,6 +21,7 @@ pip install -e .
 # Additional dependencies
 pip install pykeops torch-cluster accelerate
 ```
++ Note: pykeops is optional and only for metric calculation. It requires Cuda toolkit >=10.0 installed. 
 
 ### Dependencies
 ```
@@ -47,7 +48,7 @@ accelerate
 | `data2fit.py` | Generate samples for fitting RBF/LAND kernels and distribution-level reference sets |
 | `pair4vis.py` | Generate single interpolation trajectory for visualization |
 | `optim_path.py` | Generate distribution-level geodesic samples |
-| `dist4eval.py` | Evaluate metrics (CD, Hausdorff, F-Score) between point cloud distributions |
+| `dist4eval.py` | Evaluate metrics (CD, F-Score, etc.) between point cloud distributions |
 | `decode.py` | Decode latent representations to 3D meshes |
 | `test_benchmark.py` | Benchmark computation time and memory usage |
 | `sample_class_cond.py` | Sample from the class-conditioned diffusion model |
@@ -59,6 +60,11 @@ accelerate
 python data2fit.py \
     --dm kl_d512_m512_l8_d24_edm \
     --dm-pth output/dm/kl_d512_m512_l8_d24_edm/checkpoint-499.pth
+```
+
+```bash
+python gfm/train_kernel.py \
+    --latents_pth /path/to/latents_gen_by_data2fit.pth \
 ```
 
 ### 2. Distribution-level Geodesic Interpolation
@@ -119,7 +125,7 @@ accelerate launch decode.py \
 ```
 
 ### 5. Evaluate Distribution Metrics
-Compute Chamfer Distance, Hausdorff Distance, and F-Score between generated and reference point clouds:
+Compute Chamfer Distance, F-Score etc. between generated and reference point clouds:
 ```bash
 python dist4eval.py \
     --gen_dir ./output/shapenet/rbf/test_denoise_sigma0.3_category5_seed99995_pairs200 \
@@ -171,8 +177,8 @@ GFM-release/
 │   └── util/                 # Utilities (datasets, lr schedulers)
 ├── scripts/                  # Batch experiment scripts
 ├── notebooks/                # Jupyter notebooks
-│   ├── torus.ipynb           # Toy torus manifold experiments
-│   └── t3.ipynb              # Additional experiments
+│   ├── torus_ood.ipynb           # Toy torus manifold experiments
+│   └── torus_metrics.ipynb              # Additional experiments
 ├── data2fit.py               # Generate samples for kernel fitting
 ├── pair4vis.py               # Single trajectory visualization
 ├── optim_path.py             # Distribution-level geodesic sampling

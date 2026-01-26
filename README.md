@@ -189,6 +189,25 @@ GFM-release/
 └── eval.py                   # Autoencoder evaluation
 ```
 
+## Pretrained Models
+
+Some experiments require pretrained models from a prior method [3DShape2VecSet(Zheng et al., 2023)](https://arxiv.org/abs/2301.11445).
+
+**Download:** [Anonymous Google Drive](https://drive.google.com/drive/folders/1d-G433tCJj060fOGW4l1uY3IRIHT3wsF?usp=drive_link)
+
+Place the downloaded files as:
+```
+output/
+├── ae/
+│   └── kl_d512_m512_l8/
+│       └── checkpoint-199.pth
+└── dm/
+    └── kl_d512_m512_l8_d24_edm/
+        └── checkpoint-499.pth
+```
+
+*Camera-ready version will include proper citations and permanent links.*
+
 ## License
 
 This repository is for academic research use only.

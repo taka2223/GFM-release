@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gfm"
+version = "0.1.0"
+description = "3D Shape to Vector Set conversion package"
+readme = "README.md"
+authors = [
+    {name = "Anonymous", email = "anonymous@example.com"}
+]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision",
+    "numpy",
+    "einops",
+    "timm",
+    "torch-cluster",
+    "PyMcubes",
+    "trimesh",
+    "matplotlib",
+    "tqdm",
+    "PyYAML",
+    "scipy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "flake8",
+    "mypy",
+]
+
+[project.scripts]
+gfm-train-ae = "gfm.main_ae:main"
+gfm-train-dm = "gfm.main_class_cond:main"
+
+[tool.setuptools]
+packages = ["gfm"]
+
+[tool.setuptools.package-dir]
+gfm = "gfm"
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203", "W503"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

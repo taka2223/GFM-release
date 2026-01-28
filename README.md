@@ -55,11 +55,11 @@ accelerate
 
 ## Usage
 
-### Toy Experiments
+### 1. Toy Experiments
 
 **notebooks/torus_metrics.ipynb** and **notebooks/torus_ood.ipynb** are jupyter notebooks for the torus decoupling experiment and the torus OOD experiment
 
-### 1. Generate Reference Samples (for kernel fitting)
+### 2. Generate Reference Samples (for kernel fitting)
 ```bash
 python data2fit.py \
     --dm kl_d512_m512_l8_d24_edm \
@@ -71,7 +71,7 @@ python gfm/train_kernel.py \
     --latents_pth /path/to/latents_gen_by_data2fit.pth \
 ```
 
-### 2. Distribution-level Geodesic Interpolation
+### 3. Distribution-level Geodesic Interpolation
 Generate geodesic paths between sampled latent pairs:
 ```bash
 python optim_path.py \
@@ -92,7 +92,7 @@ python optim_path.py \
 
 Available approximators: `rbf`, `land`, `score`, `el`, `stein`
 
-### 3. Single Trajectory Visualization
+### 4. Single Trajectory Visualization
 Generate a single geodesic path for visualization:
 ```bash
 python pair4vis.py \
@@ -108,7 +108,7 @@ python pair4vis.py \
     --output_dir ./output/vis
 ```
 
-### 4. Decode Latents to Meshes
+### 5. Decode Latents to Meshes
 ```bash
 python decode.py \
     --ae kl_d512_m512_l8 \
@@ -128,7 +128,7 @@ accelerate launch decode.py \
     --output-dir ./output/meshes
 ```
 
-### 5. Evaluate Distribution Metrics
+### 6. Evaluate Distribution Metrics
 Compute Chamfer Distance, F-Score etc. between generated and reference point clouds:
 ```bash
 python dist4eval.py \
@@ -138,7 +138,7 @@ python dist4eval.py \
     --thresholds 0.05 0.1 0.15 0.2
 ```
 
-### 6. Benchmark Computation
+### 7. Benchmark Computation
 Measure time and memory consumption for different methods:
 ```bash
 python test_benchmark.py \

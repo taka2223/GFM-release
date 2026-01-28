@@ -57,7 +57,7 @@ accelerate
 
 ### Toy Experiments
 
-notebooks/torus_metrics.ipynb and notebooks/torus_ood.ipynb are jupyter notebooks for the torus decoupling experiment and the torus OOD experiment
+**notebooks/torus_metrics.ipynb** and **notebooks/torus_ood.ipynb** are jupyter notebooks for the torus decoupling experiment and the torus OOD experiment
 
 ### 1. Generate Reference Samples (for kernel fitting)
 ```bash

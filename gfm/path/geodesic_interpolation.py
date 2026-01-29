@@ -724,8 +724,7 @@ class RBFKernelInterpolator(BaseInterpolator):
         
         if normalize_iters > 0:
             self.h.normalize(latents_flat.to(self.device))
-        
-        # 直接用你的 load_metric
+
         self.metric = load_metric("conf", "rbf", self.h)
         self._fitted = True
         return self
@@ -769,8 +768,7 @@ class RBFKernelInterpolator(BaseInterpolator):
                 intermediate,
                 end_latent.unsqueeze(1)
             ], dim=1)
-            
-            # 直接用你的 metric.kinetic()
+
             velocity = (full_path[:, 1:] - full_path[:, :-1]) / dt
             midpoints = 0.5 * (full_path[:, 1:] + full_path[:, :-1])
             energy = self.metric.kinetic(midpoints, velocity).mean()*dt
@@ -839,8 +837,7 @@ class LandInterpolator(BaseInterpolator):
         
         if normalize_iters > 0:
             self.h.normalize(data_to_fit)
-        
-        # Land 用 DiagonalMetric
+
         self.metric = load_metric("diag", "land", self.h)
         self._fitted = True
         return self
@@ -905,8 +902,7 @@ class LandInterpolator(BaseInterpolator):
 
                     disp = (intermediate - init_intermediate).abs()
                     print(f"intermediate displacement: mean={disp.mean():.6f}, max={disp.max():.6f}")
-                    
-                    # g 值变化
+
                     g_diff = (g_values - init_g).abs()
                     print(f"g change: mean={g_diff.mean():.6f}, max={g_diff.max():.6f}")
         

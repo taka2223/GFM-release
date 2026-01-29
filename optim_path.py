@@ -23,7 +23,7 @@ def main(args):
     category = args.category
     seed = args.seed
     num_pairs = args.num_pairs
-    batch_size = args.batch_size  # 新增
+    batch_size = args.batch_size
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     root = os.path.join(args.output_dir, args.dataset, args.approximator)
@@ -66,41 +66,33 @@ def main(args):
     else:
         raise ValueError    
     
-    # 计算批次数
     num_batches = (num_pairs + batch_size - 1) // batch_size
     print(f"\n[Info] Total pairs: {num_pairs}, batch_size: {batch_size}, num_batches: {num_batches}", flush=True)
     
     all_paths = []
     
     for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
-        # 当前批次的起止索引
         start_idx = batch_idx * batch_size
         end_idx = min(start_idx + batch_size, num_pairs)
         current_batch_size = end_idx - start_idx
         
         print(f"\n[Batch {batch_idx+1}/{num_batches}] Processing pairs {start_idx} to {end_idx-1}", flush=True)
-        
-        ## Step 1: 采样当前批次的端点
+
         print(f"  [Step 1] Sampling {current_batch_size} pairs of clean latents...", flush=True)
         with torch.no_grad():
-            # 每对需要2个点
             class_labels = torch.tensor([category] * (2 * current_batch_size), device=device).long()
-            # seed 偏移：每个batch使用不同的seed范围
             batch_seed_start = seed + 2 * start_idx
             batch_seeds = torch.arange(batch_seed_start, batch_seed_start + 2 * current_batch_size, device=device)
             clean_latents = dm.sample(cond=class_labels, batch_seeds=batch_seeds).float()
-        
-        # 分成 start 和 end
-        start_latents = clean_latents[0::2]  # [current_batch_size, ...]
-        end_latents = clean_latents[1::2]    # [current_batch_size, ...]
+
+        start_latents = clean_latents[0::2]
+        end_latents = clean_latents[1::2]
         
         print(f"  Clean latents: start={start_latents.shape}, end={end_latents.shape}", flush=True)
-        
-        ## Step 2: 优化路径
+
         print(f"  [Step 2] Optimizing paths...", flush=True)
-        
+
         if args.approximator not in ['rbf', 'land']:
-            # 批量加噪
             noisy_start = interpolator.add_noise(start_latents, sigma=SIGMA)
             noisy_end = interpolator.add_noise(end_latents, sigma=SIGMA)
             
@@ -114,8 +106,7 @@ def main(args):
                 class_label=batch_class_labels,
                 max_iters=args.max_iters
             )
-            
-            # 批量去噪
+
             paths = interpolator.denoise_path(paths, sigma_start=SIGMA, 
                                               class_label=batch_class_labels, 
                                               num_denoise_steps=5)
@@ -126,21 +117,17 @@ def main(args):
                 num_steps=10, 
                 lr=args.lr
             )
-        
-        # 保存当前批次的路径（移到CPU以节省GPU内存）
+
         all_paths.append(paths.cpu())
-        
-        # 清理GPU内存
+
         del clean_latents, start_latents, end_latents, paths
         if args.approximator not in ['rbf', 'land']:
             del noisy_start, noisy_end
         torch.cuda.empty_cache()
-    
-    # 合并所有路径
-    all_paths = torch.cat(all_paths, dim=0)  # [num_pairs, num_steps, ...]
+
+    all_paths = torch.cat(all_paths, dim=0)
     print(f"\n[Info] All paths shape: {all_paths.shape}", flush=True)
-    
-    # Step 3: 顺序解码保存
+
     print(f"\n[Step 3] Saving {num_pairs} paths (sequential decode)...", flush=True)
     for pair_idx in tqdm(range(num_pairs), desc="Decoding"):
         for step_idx in range(all_paths.shape[1]):

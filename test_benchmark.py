@@ -74,15 +74,15 @@ def benchmark_optimize_path(interpolator, start_latent, end_latent, args,
         'time_mean': np.mean(times),
         'time_std': np.std(times),
         'memory_gb': peak_memory_gb,
-        'losses': all_losses[-1],  # 最后一次run的losses
-        'all_losses': all_losses,   # 所有runs的losses (用于检查一致性)
+        'losses': all_losses[-1],
+        'all_losses': all_losses,
         'iterations': len(all_losses[-1]),
         'final_loss': all_losses[-1][-1] if all_losses[-1] else None,
     }
 
 
 def save_convergence_plot(all_stats, output_dir, approximator):
-    """保存convergence曲线图."""
+    """Save convergence curve plot."""
     plt.figure(figsize=(8, 5))
     
     losses = all_stats['losses']
@@ -148,9 +148,8 @@ def main(args):
     elif args.approximator == 'stein':
         interpolator = SteinScoreInterpolator(dm, ae, device=device)
     else:
-        raise ValueError    
-    
-    # 计算批次数
+        raise ValueError
+
     num_batches = (num_pairs + batch_size - 1) // batch_size
     print(f"\n[Info] Total pairs: {num_pairs}, batch_size: {batch_size}, num_batches: {num_batches}", flush=True)
     
@@ -163,14 +162,12 @@ def main(args):
     }
     
     for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
-        # 当前批次的起止索引
         start_idx = batch_idx * batch_size
         end_idx = min(start_idx + batch_size, num_pairs)
         current_batch_size = end_idx - start_idx
         
         print(f"\n[Batch {batch_idx+1}/{num_batches}] Processing pairs {start_idx} to {end_idx-1}", flush=True)
-        
-        ## Step 1: 采样当前批次的端点
+
         print(f"  [Step 1] Sampling {current_batch_size} pairs of clean latents...", flush=True)
         with torch.no_grad():
             class_labels = torch.tensor([category] * (2 * current_batch_size), device=device).long()
@@ -182,8 +179,7 @@ def main(args):
         end_latents = clean_latents[1::2]
         
         print(f"  Clean latents: start={start_latents.shape}, end={end_latents.shape}", flush=True)
-        
-        ## Step 2: 优化路径 (带benchmark)
+
         print(f"  [Step 2] Optimizing paths...", flush=True)
         
         if args.approximator not in ['rbf', 'land']:
@@ -192,10 +188,9 @@ def main(args):
             batch_class_labels = torch.tensor([category] * current_batch_size, device=device).long()
             
             if args.benchmark:
-                # Benchmark模式：只用第一对进行benchmark
                 paths, stats = benchmark_optimize_path(
                     interpolator=interpolator,
-                    start_latent=noisy_start[:1],  # 只用一对做benchmark
+                    start_latent=noisy_start[:1],
                     end_latent=noisy_end[:1],
                     args=args,
                     class_label=batch_class_labels[:1],
@@ -203,8 +198,7 @@ def main(args):
                     warmup=args.warmup_runs,
                     runs=args.benchmark_runs
                 )
-                
-                # 记录stats
+
                 all_stats['times'].append(stats['time_mean'])
                 all_stats['memories'].append(stats['memory_gb'])
                 all_stats['final_losses'].append(stats['final_loss'])
@@ -213,7 +207,7 @@ def main(args):
                 print(f"  [Benchmark] Time: {stats['time_mean']:.3f} ± {stats['time_std']:.3f} s, "
                       f"Memory: {stats['memory_gb']:.2f} GB, "
                       f"Final Loss: {stats['final_loss']:.2e}", flush=True)
-                    ## 保存统计结果
+
                 if args.benchmark and all_stats['times']:
                     summary = {
                         'method': args.approximator,
@@ -232,19 +226,16 @@ def main(args):
                     print(f"  Final Loss: {summary['final_loss_mean']:.2e}")
                     print(f"  Iterations: {summary['iterations']}")
                     print(f"{'='*50}\n")
-                    
-                    # 保存JSON
+
                     with open(os.path.join(output_dir, 'benchmark_stats.json'), 'w') as f:
                         json.dump(summary, f, indent=2)
-                    
-                    # 保存convergence曲线
+
                     if all_stats['losses_per_batch']:
-                        avg_losses = all_stats['losses_per_batch'][0]  # 用第一个batch的losses画图
+                        avg_losses = all_stats['losses_per_batch'][0]
                         save_convergence_plot({'losses': avg_losses}, output_dir, args.approximator)
-                        
-                        # 也保存raw losses数据
+
                         np.save(os.path.join(output_dir, 'losses.npy'), np.array(avg_losses))
-                # 正常跑完整batch
+
                 paths, info = interpolator.optimize_path(
                     start_latent=noisy_start,
                     end_latent=noisy_end,
@@ -264,7 +255,6 @@ def main(args):
                     class_label=batch_class_labels,
                     max_iters=args.max_iters
                 )
-                # 记录losses (非benchmark模式)
                 all_stats['losses_per_batch'].append(info.get('losses', []))
             
             paths = interpolator.denoise_path(paths, sigma_start=SIGMA, 
@@ -284,14 +274,10 @@ def main(args):
         if args.approximator not in ['rbf', 'land']:
             del noisy_start, noisy_end
         torch.cuda.empty_cache()
-    
-    # 合并所有路径
+
     all_paths = torch.cat(all_paths, dim=0)
     print(f"\n[Info] All paths shape: {all_paths.shape}", flush=True)
-    
 
-    
-    # Step 3: 顺序解码保存
     print(f"\n[Step 3] Saving {num_pairs} paths (sequential decode)...", flush=True)
     for pair_idx in tqdm(range(num_pairs), desc="Decoding"):
         for step_idx in range(all_paths.shape[1]):
@@ -323,8 +309,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_pairs', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=16, help='batch size for sampling and optimization')
     parser.add_argument('--max_iters', type=int, default=400, help='max iterations for optimization')
-    
-    # 新增benchmark参数
+
     parser.add_argument('--benchmark', action='store_true', help='enable benchmarking')
     parser.add_argument('--warmup_runs', type=int, default=1, help='warmup runs for benchmark')
     parser.add_argument('--benchmark_runs', type=int, default=3, help='number of runs for timing')

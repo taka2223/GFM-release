@@ -138,7 +138,6 @@ class h_diag_RBF(nn.Module):
         return centroids
     
     def forward(self, x_t):
-        # [FIX] 记录原始shape用于恢复
         input_shape = x_t.shape
         if len(x_t.shape) > 2:
             self.nb_samples, self.nb_interp, *self.feature_size = x_t.shape
@@ -147,12 +146,7 @@ class h_diag_RBF(nn.Module):
         phi_x = torch.exp(-0.5 * self.lamda[None, :, :] * dist2[:, :, None])
         #phi_x = torch.exp(-0.5 * dist2[:, :, None])
         h_x = (self.W.unsqueeze(0)*phi_x).sum(dim=1)
-        #te = h_x.view(8, 50)
-        #plt.plot(te.t().cpu().detach())
-        #plt.show()
-        # [FIX] squeeze(-1) 而非 squeeze()，避免batch=1时变成标量
         result = 1/(h_x.squeeze(-1) + 1e-3)
-        # [FIX] 恢复原始batch结构
         if len(input_shape) > 2:
             result = result.view(input_shape[0], input_shape[1])
         return result
@@ -164,9 +158,7 @@ class h_diag_RBF(nn.Module):
         dist2 = torch.cdist(x_t, self.C) ** 2
         phi_x = torch.exp(-0.5 * self.lamda[None, :, :] * dist2[:, :, None]).detach()
 
-        #phi_x = torch.exp(-0.5 * dist2[:, :, None]).detach()
         h_x = (self.W.unsqueeze(0)*phi_x).sum(dim=1)
-        # [FIX] squeeze(-1) 保持一致
         return h_x.squeeze(-1)
     
     def normalize(self, data_to_train):

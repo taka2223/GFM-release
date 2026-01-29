@@ -29,7 +29,6 @@ import torch
 import trimesh
 from tqdm import tqdm
 
-# 核心加速库
 from pykeops.torch import LazyTensor
 from torch_cluster import fps
 
@@ -149,8 +148,7 @@ def chamfer_distance_kernel(x, y):
     """
     x_i = LazyTensor(x[:, :, None, :])  # [B, N, 1, 3]
     y_j = LazyTensor(y[:, None, :, :])  # [B, 1, N, 3]
-    
-    # 符号距离矩阵 D_ij，逻辑形状为 [B, N, N]
+
     D_ij = ((x_i - y_j) ** 2).sum(-1)
     
     # min over y for each x

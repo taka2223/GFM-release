@@ -5,11 +5,13 @@
 ## Installation
 
 ### Requirements
+
 - Python >= 3.8
 - PyTorch >= 1.10.0
 - CUDA compatible GPU
 
 ### Install from source
+
 ```bash
 # Clone the repository
 git clone https://github.com/anonymous/GFM-release.git
@@ -21,9 +23,11 @@ pip install -e .
 # Additional dependencies
 pip install pykeops torch-cluster accelerate
 ```
-+ Note: pykeops is optional and only for metric calculation. It requires Cuda toolkit >=10.0 installed. 
+
++ Note: pykeops is optional and only for metric calculation. It requires Cuda toolkit >=10.0 installed.
 
 ### Dependencies
+
 ```
 torch>=1.10.0
 torchvision
@@ -60,6 +64,7 @@ accelerate
 **notebooks/torus_metrics.ipynb** and **notebooks/torus_ood.ipynb** are jupyter notebooks for the torus decoupling experiment and the torus OOD experiment
 
 ### 2. Generate Reference Samples (for kernel fitting)
+
 ```bash
 python data2fit.py \
     --dm kl_d512_m512_l8_d24_edm \
@@ -72,7 +77,9 @@ python gfm/train_kernel.py \
 ```
 
 ### 3. Distribution-level Geodesic Interpolation
+
 Generate geodesic paths between sampled latent pairs:
+
 ```bash
 python optim_path.py \
     --dataset shapenet \
@@ -93,7 +100,9 @@ python optim_path.py \
 Available approximators: `rbf`, `land`, `score`, `el`, `stein`
 
 ### 4. Single Trajectory Visualization
+
 Generate a single geodesic path for visualization:
+
 ```bash
 python pair4vis.py \
     --dataset shapenet \
@@ -109,6 +118,7 @@ python pair4vis.py \
 ```
 
 ### 5. Decode Latents to Meshes
+
 ```bash
 python decode.py \
     --ae kl_d512_m512_l8 \
@@ -120,6 +130,7 @@ python decode.py \
 ```
 
 For multi-GPU decoding:
+
 ```bash
 accelerate launch decode.py \
     --ae kl_d512_m512_l8 \
@@ -129,7 +140,9 @@ accelerate launch decode.py \
 ```
 
 ### 6. Evaluate Distribution Metrics
+
 Compute Chamfer Distance, F-Score etc. between generated and reference point clouds:
+
 ```bash
 python dist4eval.py \
     --gen_dir ./output/shapenet/rbf/test_denoise_sigma0.3_category5_seed99995_pairs200 \
@@ -139,7 +152,9 @@ python dist4eval.py \
 ```
 
 ### 7. Benchmark Computation
+
 Measure time and memory consumption for different methods:
+
 ```bash
 python test_benchmark.py \
     --dataset shapenet \
@@ -197,9 +212,10 @@ GFM-release/
 
 Some experiments require pretrained models from a prior method [3DShape2VecSet(Zheng et al., 2023)](https://arxiv.org/abs/2301.11445).
 
-**Download:** [Anonymous Google Drive](https://drive.google.com/drive/folders/1d-G433tCJj060fOGW4l1uY3IRIHT3wsF?usp=drive_link)
+**Download:** [Google Drive](https://drive.google.com/drive/folders/1EIcX4wYATcS5OY7tE6BDVBClbuCw_AmT)
 
 Place the downloaded files as:
+
 ```
 output/
 ├── ae/

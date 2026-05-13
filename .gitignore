@@ -6,3 +6,6 @@ notebooks/output/
 results/
 *.log
 *egg-info/
+test_outputs/
+__pycache__/
+*.pyc

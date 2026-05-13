@@ -9,19 +9,23 @@ Flexible framework supporting multiple interpolation methods:
 Follows extensible design - implement method-specific optimization strategies.
 """
 
+import ot
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 from abc import ABC, abstractmethod
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 from gfm.models.models_class_cond import edm_sampler
 from gfm.path.metrics import load_metric, h_diag_RBF
+from gfm.path.helper import free_support_barycenter, ref_alignment, ref_supports_from_alignment
+from gfm.path.mccan import mccann_interpolation
 
 class BaseInterpolator(ABC):
     """
     Abstract base class for latent space interpolation methods.
-    
+
     Provides common functionality and defines interface for method-specific optimization.
     """
 
@@ -44,23 +48,25 @@ class BaseInterpolator(ABC):
         self, start_latent: torch.Tensor, end_latent: torch.Tensor, num_steps: int
     ) -> torch.Tensor:
         """
-        Simple linear interpolation baseline.
-
-        Args:
-            start_latent: [batch, n_latents, channels] or [1, n_latents, channels]
-            end_latent: [batch, n_latents, channels] or [1, n_latents, channels]
-            num_steps: Number of interpolation steps
-
-        Returns:
-            interpolated: [batch, num_steps, n_latents, channels]
+        通用线性插值，支持任意 shape 的 latent。
         """
-        batch_size = start_latent.shape[0]
-        t = torch.linspace(0, 1, num_steps, device=self.device).view(1, -1, 1, 1)
-        interpolated = (
-            start_latent.unsqueeze(1)
-            + (end_latent.unsqueeze(1) - start_latent.unsqueeze(1)) * t
-        )
-        return interpolated
+        original_shape = start_latent.shape
+        batch_size = original_shape[0]
+
+        # 1. 扁平化以便处理：[batch, D]
+        start_flat = start_latent.view(batch_size, -1)
+        end_flat = end_latent.view(batch_size, -1)
+
+        # 2. 准备时间步权重：[1, num_steps, 1]
+        t = torch.linspace(0, 1, num_steps, device=self.device).view(1, num_steps, 1)
+
+        # 3. 在扁平空间进行插值：[batch, num_steps, D]
+        # 公式：(1 - t) * start + t * end
+        interpolated = start_flat.unsqueeze(1) * (1 - t) + end_flat.unsqueeze(1) * t
+
+        # 4. 还原回原始形状，并插入 num_steps 维度
+        # 输出形状：[batch, num_steps, *original_shape[1:]]
+        return interpolated.view(batch_size, num_steps, *original_shape[1:])
 
     def compute_force(
         self,
@@ -124,29 +130,29 @@ class BaseInterpolator(ABC):
         start_latent: torch.Tensor,
         end_latent: torch.Tensor,
         num_steps: int = 10,
-        **kwargs
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Method-specific path optimization implementation.
-        
+
         Args:
             start_latent: [batch, n_latents, channels] start points
-            end_latent: [batch, n_latents, channels] end points  
+            end_latent: [batch, n_latents, channels] end points
             num_steps: Number of intermediate points
             **kwargs: Method-specific optimization parameters
-            
+
         Returns:
             optimized_path: [batch, num_steps, n_latents, channels] optimized trajectories
             info: Dictionary with optimization info (losses, metrics, etc.)
         """
         pass
-    
+
     def optimize_path(
         self,
         start_latent: torch.Tensor,
         end_latent: torch.Tensor,
         num_steps: int = 10,
-        **kwargs
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         High-level interface for path optimization. Delegates to method-specific implementation.
@@ -182,7 +188,6 @@ class BaseInterpolator(ABC):
         Returns:
             clean_path: [batch, num_steps, n_latents, channels] denoised path
         """
-        
 
         batch_size, num_steps = noisy_path.shape[:2]
 
@@ -222,37 +227,37 @@ class BaseInterpolator(ABC):
 class ELInterpolator(BaseInterpolator):
     """
     Euler-Lagrange Interpolator: Geodesic on sphere with score-based force.
-    
+
     Minimizes: ||acc_geodesic + λ * force_tangent||²
     """
-    
+
     def slerp_interpolate(
         self, start_latent: torch.Tensor, end_latent: torch.Tensor, num_steps: int
     ) -> torch.Tensor:
         """Standard SLERP for initialization."""
         original_shape = start_latent.shape
         batch_size = original_shape[0]
-        
+
         start_flat = start_latent.view(batch_size, -1)
         end_flat = end_latent.view(batch_size, -1)
-        
+
         start_norm = start_flat.norm(dim=-1, keepdim=True)
         end_norm = end_flat.norm(dim=-1, keepdim=True)
         dot = (start_flat * end_flat).sum(dim=-1, keepdim=True)
-        
+
         cos_omega = (dot / (start_norm * end_norm + 1e-8)).clamp(-1 + 1e-7, 1 - 1e-7)
         omega = torch.acos(cos_omega)
         sin_omega = torch.sin(omega)
-        
+
         t = torch.linspace(0, 1, num_steps, device=self.device).view(1, num_steps, 1)
-        
+
         s0 = torch.sin((1 - t) * omega.unsqueeze(1)) / (sin_omega.unsqueeze(1) + 1e-8)
         s1 = torch.sin(t * omega.unsqueeze(1)) / (sin_omega.unsqueeze(1) + 1e-8)
-        
+
         small_angle = sin_omega.unsqueeze(1).abs() < 1e-6
         s0 = torch.where(small_angle, 1 - t, s0)
         s1 = torch.where(small_angle, t, s1)
-        
+
         result_flat = s0 * start_flat.unsqueeze(1) + s1 * end_flat.unsqueeze(1)
         return result_flat.view(batch_size, num_steps, *original_shape[1:])
 
@@ -261,13 +266,13 @@ class ELInterpolator(BaseInterpolator):
         """Project vector v onto tangent space of sphere at point x."""
         x_flat = x.flatten(start_dim=1)
         v_flat = v.flatten(start_dim=1)
-        
+
         dot = (v_flat * x_flat).sum(dim=-1, keepdim=True)
         x_norm_sq = (x_flat * x_flat).sum(dim=-1, keepdim=True)
-        
+
         normal_component = (dot / (x_norm_sq + 1e-8)) * x_flat
         tangent_v = v_flat - normal_component
-        
+
         return tangent_v.view_as(v)
 
     def _optimize_path_impl(
@@ -281,120 +286,283 @@ class ELInterpolator(BaseInterpolator):
         class_label: Optional[torch.Tensor] = None,
         lam: float = 1.0,
         verbose: bool = True,
-        **kwargs
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Optimize geodesic on sphere with score-based force."""
         batch_size = start_latent.shape[0]
-        
+
         path = self.slerp_interpolate(start_latent, end_latent, num_steps)
-        
+
         if num_steps <= 2:
             return path, {"losses": [], "method": "euler_lagrange"}
-        
+
         x0 = path[:, 0]
         x1 = path[:, -1]
         x_inner = path[:, 1:-1].clone().detach().requires_grad_(True)
-        
+
         dt = 1.0 / (num_steps - 1)
         n_inner = num_steps - 2
-        
+
         optimizer = torch.optim.Adam([x_inner], lr=lr, eps=1e-5)
         losses = []
-        
+
         # Prepare expanded class labels once (for n_inner points per batch)
         if class_label is not None:
             if class_label.numel() == 1:
                 cls_labels_expanded = class_label.expand(batch_size * n_inner)
             else:
-                cls_labels_expanded = class_label.unsqueeze(1).expand(-1, n_inner).reshape(-1)
+                cls_labels_expanded = (
+                    class_label.unsqueeze(1).expand(-1, n_inner).reshape(-1)
+                )
         else:
             cls_labels_expanded = None
-        
+
         for iteration in range(max_iters):
             optimizer.zero_grad()
-            
+
             full_path = torch.cat([x0.unsqueeze(1), x_inner, x1.unsqueeze(1)], dim=1)
-            
+
             # Geodesic acceleration
-            acc_euclidean = (full_path[:, 2:] - 2 * full_path[:, 1:-1] + full_path[:, :-2]) / (dt ** 2)
+            acc_euclidean = (
+                full_path[:, 2:] - 2 * full_path[:, 1:-1] + full_path[:, :-2]
+            ) / (dt**2)
             x_mid = full_path[:, 1:-1].reshape(-1, *full_path.shape[2:])
             acc_flat = acc_euclidean.reshape(-1, *acc_euclidean.shape[2:])
-            acc_geodesic = self.project_to_tangent_space(x_mid, acc_flat).view_as(acc_euclidean)
-            
+            acc_geodesic = self.project_to_tangent_space(x_mid, acc_flat).view_as(
+                acc_euclidean
+            )
+
             # Reuse compute_force from BaseInterpolator
             x_inner_flat = x_inner.reshape(-1, *x_inner.shape[2:])
-            force_euclidean = self.compute_force(x_inner_flat, sigma, cls_labels_expanded)
-            
+            force_euclidean = self.compute_force(
+                x_inner_flat, sigma, cls_labels_expanded
+            )
+
             # Project force to tangent space
-            force_tangent = self.project_to_tangent_space(x_inner_flat, force_euclidean).view_as(x_inner)
-            
+            force_tangent = self.project_to_tangent_space(
+                x_inner_flat, force_euclidean
+            ).view_as(x_inner)
+
             # Loss
             loss = ((acc_geodesic + lam * force_tangent) ** 2).mean()
-            
+
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
-            
+
             if verbose and iteration % 20 == 0:
                 print(f"Iter {iteration}: loss = {loss.item():.6f}")
-        
-        final_path = torch.cat([x0.unsqueeze(1), x_inner.detach(), x1.unsqueeze(1)], dim=1)
-        
+
+        final_path = torch.cat(
+            [x0.unsqueeze(1), x_inner.detach(), x1.unsqueeze(1)], dim=1
+        )
+
         return final_path, {
             "losses": losses,
             "method": "euler_lagrange",
             "sigma": sigma,
             "lambda": lam,
-            "iterations": max_iters
+            "iterations": max_iters,
         }
+
+
+class SeqELInterpolator(ELInterpolator):
+    """
+    混合策略插值器:
+      - Sequential warmup: 球面投影 + force + acceleration
+      - Global refinement: 欧式空间 Euler-Lagrange
+    """
+
+    def project_to_sphere(self, x: torch.Tensor, radius: torch.Tensor) -> torch.Tensor:
+        """将 latent 投影到指定半径的球面上。"""
+        x_flat = x.flatten(start_dim=1)
+        norms = x_flat.norm(dim=-1, keepdim=True)
+        if radius.dim() == 1:
+            r = radius.view(-1, 1)
+        else:
+            r = radius
+        x_flat = x_flat * (r / (norms + 1e-8))
+        return x_flat.view_as(x)
+
+    def _sequential_warmup(
+        self,
+        start_latent: torch.Tensor,
+        end_latent: torch.Tensor,
+        num_steps: int,
+        sigma: float,
+        lr: float,
+        warmup_iters: int = 50,
+        lam: float = 1.0,
+        class_label: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        device = start_latent.device
+        batch_size = start_latent.shape[0]
+        
+        path = [start_latent.clone()]
+        current_z = start_latent.clone()
+        
+        dt = 1.0 / (num_steps - 1)
+        
+        # 球面半径：取 start/end 的平均 norm
+        radius = start_latent.reshape(batch_size, -1).norm(dim=-1)
+
+        print(f"  [SeqInit] Sphere warmup ({num_steps} steps, radius={radius.mean().item():.2f})...")
+        
+        for i in tqdm(range(1, num_steps - 1), desc="Propagating Steps"):
+            # 初始化：从上一帧出发 + drift toward endpoint
+            drift = (end_latent - current_z) / (num_steps - i)
+            z_i = (current_z + drift).detach().requires_grad_(True)
+            
+            inner_opt = torch.optim.AdamW([z_i], lr=lr * 0.5)
+            
+            for inner_it in range(warmup_iters):
+                inner_opt.zero_grad()
+                
+                # 球面投影（每步都拉回球面）
+                # with torch.no_grad():
+                #     z_i_proj = self.project_to_sphere(z_i, radius)
+                #     z_i.copy_(z_i_proj)
+                
+                # ---- Force term ----
+                force = self.compute_force(z_i, sigma, class_label)
+                loss_force = (force ** 2).mean()
+                
+                # ---- Acceleration term ----
+                if i >= 2:
+                    prev = path[i - 1]      # detached
+                    prev_prev = path[i - 2]  # detached
+                    acc = (z_i - 2 * prev + prev_prev) / (dt ** 2)
+                    loss_acc = (acc ** 2).mean()
+                else:
+                    # i=1: velocity regularity
+                    vel_expected = (end_latent - start_latent) / (num_steps - 1)
+                    vel_actual = z_i - path[0]
+                    loss_acc = ((vel_actual - vel_expected) ** 2).mean()
+                
+                loss = loss_force + lam * loss_acc
+                loss.backward()
+                inner_opt.step()
+            
+            # 最终投影
+            # with torch.no_grad():
+            #     z_i_proj = self.project_to_sphere(z_i, radius)
+            #     z_i.copy_(z_i_proj)
+            
+            current_z = z_i.detach()
+            path.append(current_z.clone())
+            
+        path.append(end_latent.clone())
+        return torch.stack(path, dim=1)
+
+    def _optimize_path_impl(
+        self,
+        start_latent: torch.Tensor,
+        end_latent: torch.Tensor,
+        num_steps: int = 10,
+        sigma: float = 0.1,
+        lr: float = 0.05,
+        max_iters: int = 200,
+        lam: float = 1.0,
+        verbose: bool = True,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        # 步骤 1：球面顺序初始化（force + acc）
+        path_init = self._sequential_warmup(
+            start_latent, end_latent, num_steps, sigma, 
+            lr=lr, warmup_iters=max_iters // 10, lam=lam
+        )
+        
+        # 步骤 2：欧式全局优化（Euler-Lagrange: acc + λ·force = 0）
+        x_inner = path_init[:, 1:-1].clone().detach().requires_grad_(True)
+        
+        dt = 1.0 / (num_steps - 1)
+        optimizer = torch.optim.AdamW([x_inner], lr=lr * 0.2)
+        losses = []
+        
+        print(f"  [SeqEL] Euclidean global refinement...")
+        
+        for iteration in range(max_iters):
+            optimizer.zero_grad()
+            
+            full_path = torch.cat([
+                start_latent.unsqueeze(1), x_inner, end_latent.unsqueeze(1)
+            ], dim=1)
+
+            # 加速度
+            acc = (full_path[:, 2:] - 2 * full_path[:, 1:-1] + full_path[:, :-2]) / (dt ** 2)
+            
+            # Force
+            x_mid = full_path[:, 1:-1].reshape(-1, *full_path.shape[2:])
+            force = self.compute_force(x_mid, sigma)
+            force = force.reshape(acc.shape)
+            
+            # EL residual
+            residual = acc + lam * force
+            loss = (residual ** 2).mean()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+            
+            if verbose and iteration % 50 == 0:
+                print(f"  Iter {iteration}: loss = {loss.item():.6f}")
+        
+        final_path = torch.cat([
+            start_latent.unsqueeze(1), x_inner.detach(), end_latent.unsqueeze(1)
+        ], dim=1)
+        return final_path, {"losses": losses, "method": "seq_sphere_init_euclidean_refine"}
+
 
 
 class ScoreBasedInterpolator(BaseInterpolator):
     """
     Score-based geodesic interpolation using Jacobian of score function as metric.
-    
+
     Metric: g_x(v, w) = v^T J^T J w, where J = ∇_x s(x, t)
     Energy: E[γ] = (1/2) Σ ||s(x_{i+1}) - s(x_i)||² / Δu
     """
-    
+
     def slerp_interpolate(
         self, start_latent: torch.Tensor, end_latent: torch.Tensor, num_steps: int
     ) -> torch.Tensor:
         """Spherical linear interpolation (paper recommends for initialization)."""
         original_shape = start_latent.shape
         batch_size = original_shape[0]
-        
+
         # Flatten to [batch, D]
         start_flat = start_latent.view(batch_size, -1)
         end_flat = end_latent.view(batch_size, -1)
-        
+
         # Unit vectors and norms
         start_norm = start_flat.norm(dim=-1, keepdim=True)
         end_norm = end_flat.norm(dim=-1, keepdim=True)
         start_unit = start_flat / (start_norm + 1e-8)
         end_unit = end_flat / (end_norm + 1e-8)
-        
+
         # Angle
-        cos_theta = (start_unit * end_unit).sum(dim=-1, keepdim=True).clamp(-1 + 1e-7, 1 - 1e-7)
+        cos_theta = (
+            (start_unit * end_unit).sum(dim=-1, keepdim=True).clamp(-1 + 1e-7, 1 - 1e-7)
+        )
         theta = torch.acos(cos_theta)
         sin_theta = torch.sin(theta)
-        
+
         # Interpolation
         t = torch.linspace(0, 1, num_steps, device=self.device).view(1, num_steps, 1)
         w0 = torch.sin((1 - t) * theta.unsqueeze(1)) / (sin_theta.unsqueeze(1) + 1e-8)
         w1 = torch.sin(t * theta.unsqueeze(1)) / (sin_theta.unsqueeze(1) + 1e-8)
-        
+
         # Fall back to linear for small angles
         small_angle = sin_theta.unsqueeze(1).abs() < 1e-6
         w0 = torch.where(small_angle, 1 - t, w0)
         w1 = torch.where(small_angle, t, w1)
-        
+
         # Interpolate direction and norm
         norm_interp = start_norm.unsqueeze(1) * (1 - t) + end_norm.unsqueeze(1) * t
         interp_unit = w0 * start_unit.unsqueeze(1) + w1 * end_unit.unsqueeze(1)
         interp_unit = interp_unit / (interp_unit.norm(dim=-1, keepdim=True) + 1e-8)
-        
-        return (interp_unit * norm_interp).view(batch_size, num_steps, *original_shape[1:])
+
+        return (interp_unit * norm_interp).view(
+            batch_size, num_steps, *original_shape[1:]
+        )
 
     def compute_score(
         self,
@@ -404,14 +572,16 @@ class ScoreBasedInterpolator(BaseInterpolator):
     ) -> torch.Tensor:
         """
         Score function s(x, σ) = (D(x, σ) - x) / σ² = -force
-        
+
         Note: Needs gradient tracking, so we don't use no_grad here.
         """
         batch_size = latent.shape[0]
-        sigma_tensor = torch.full((batch_size,), sigma, device=self.device, dtype=latent.dtype)
-        
+        sigma_tensor = torch.full(
+            (batch_size,), sigma, device=self.device, dtype=latent.dtype
+        )
+
         x_pred = self.model(latent, sigma_tensor, class_labels)
-        return (x_pred - latent) / (sigma ** 2)
+        return (x_pred - latent) / (sigma**2)
 
     def _optimize_path_impl(
         self,
@@ -425,124 +595,129 @@ class ScoreBasedInterpolator(BaseInterpolator):
         init_with_slerp: bool = True,
         lr_min_ratio: float = 0.1,
         verbose: bool = True,
-        **kwargs
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Minimize score-change energy (Eq. 11 from paper):
             E[γ] = (1/2) Σ ||s(x_{i+1}) - s(x_i)||² / Δu
         """
         batch_size = start_latent.shape[0]
-        
+
         # Initialize with SLERP (paper recommendation) or LERP
         if init_with_slerp:
             path = self.slerp_interpolate(start_latent, end_latent, num_steps)
         else:
             path = self.linear_interpolate(start_latent, end_latent, num_steps)
-        
+
         if num_steps <= 2:
             return path, {"losses": [], "method": "score_tangent"}
-        
+
         # Optimize intermediate points only (endpoints fixed)
         intermediate = path[:, 1:-1].clone().detach().requires_grad_(True)
-        
+
         optimizer = torch.optim.Adam([intermediate], lr=lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=max_iters, eta_min=lr * lr_min_ratio
         )
-        
+
         losses = []
         du = 1.0 / (num_steps - 1)
-        
+
         for iteration in range(max_iters):
             optimizer.zero_grad()
-            
+
             # Full path with fixed endpoints
-            full_path = torch.cat([
-                start_latent.unsqueeze(1),
-                intermediate,
-                end_latent.unsqueeze(1)
-            ], dim=1)
-            
+            full_path = torch.cat(
+                [start_latent.unsqueeze(1), intermediate, end_latent.unsqueeze(1)],
+                dim=1,
+            )
+
             # Flatten for model: [batch * num_steps, ...]
             path_flat = full_path.view(-1, *full_path.shape[2:])
-            
+
             # Expand class labels
             if class_label is not None:
                 if class_label.numel() == 1:
                     class_labels_exp = class_label.expand(path_flat.shape[0])
                 else:
-                    class_labels_exp = class_label.unsqueeze(1).expand(-1, num_steps).reshape(-1)
+                    class_labels_exp = (
+                        class_label.unsqueeze(1).expand(-1, num_steps).reshape(-1)
+                    )
             else:
                 class_labels_exp = None
-            
+
             # Compute scores
-            scores = self.compute_score(path_flat, sigma, class_labels_exp).view_as(full_path)
-            
+            scores = self.compute_score(path_flat, sigma, class_labels_exp).view_as(
+                full_path
+            )
+
             # Energy: E = (1/2) Σ ||s_{i+1} - s_i||² / Δu
             score_diff = scores[:, 1:] - scores[:, :-1]
-            energy = 0.5 * (score_diff ** 2).sum() / du
-            
+            energy = 0.5 * (score_diff**2).sum() / du
+
             energy.backward()
             optimizer.step()
             scheduler.step()
-            
+
             losses.append(energy.item())
-            
+
             if verbose and iteration % 50 == 0:
-                print(f"Iter {iteration}: Energy = {energy.item():.6f}, lr = {scheduler.get_last_lr()[0]:.6f}")
-        
-        final_path = torch.cat([
-            start_latent.unsqueeze(1),
-            intermediate.detach(),
-            end_latent.unsqueeze(1)
-        ], dim=1)
-        
+                print(
+                    f"Iter {iteration}: Energy = {energy.item():.6f}, lr = {scheduler.get_last_lr()[0]:.6f}"
+                )
+
+        final_path = torch.cat(
+            [start_latent.unsqueeze(1), intermediate.detach(), end_latent.unsqueeze(1)],
+            dim=1,
+        )
+
         return final_path, {
             "losses": losses,
-            "method": "score_tangent", 
+            "method": "score_tangent",
             "sigma": sigma,
-            "iterations": max_iters
+            "iterations": max_iters,
         }
+
 
 class SteinScoreInterpolator(BaseInterpolator):
     """
     Stein Score Metric interpolation from Azeglio & Di Bernardo (2025).
     "What's Inside Your Diffusion Model? A Score-Based Riemannian Metric"
-    
+
     Metric: g(x) = I + λ · s(x)s(x)^T
     Energy: E = (1/2) Σ [||v||² + λ(s^T v)²]
-    
+
     The metric penalizes movement perpendicular to the data manifold
     while preserving movement along tangential directions.
     """
-    
+
     def slerp_interpolate(
         self, start_latent: torch.Tensor, end_latent: torch.Tensor, num_steps: int
     ) -> torch.Tensor:
         """Standard SLERP for initialization."""
         original_shape = start_latent.shape
         batch_size = original_shape[0]
-        
+
         start_flat = start_latent.view(batch_size, -1)
         end_flat = end_latent.view(batch_size, -1)
-        
+
         start_norm = start_flat.norm(dim=-1, keepdim=True)
         end_norm = end_flat.norm(dim=-1, keepdim=True)
         dot = (start_flat * end_flat).sum(dim=-1, keepdim=True)
-        
+
         cos_omega = (dot / (start_norm * end_norm + 1e-8)).clamp(-1 + 1e-7, 1 - 1e-7)
         omega = torch.acos(cos_omega)
         sin_omega = torch.sin(omega)
-        
+
         t = torch.linspace(0, 1, num_steps, device=self.device).view(1, num_steps, 1)
-        
+
         s0 = torch.sin((1 - t) * omega.unsqueeze(1)) / (sin_omega.unsqueeze(1) + 1e-8)
         s1 = torch.sin(t * omega.unsqueeze(1)) / (sin_omega.unsqueeze(1) + 1e-8)
-        
+
         small_angle = sin_omega.unsqueeze(1).abs() < 1e-6
         s0 = torch.where(small_angle, 1 - t, s0)
         s1 = torch.where(small_angle, t, s1)
-        
+
         result_flat = s0 * start_flat.unsqueeze(1) + s1 * end_flat.unsqueeze(1)
         return result_flat.view(batch_size, num_steps, *original_shape[1:])
 
@@ -554,18 +729,20 @@ class SteinScoreInterpolator(BaseInterpolator):
     ) -> torch.Tensor:
         """
         Score s(x) = (D(x) - x) / σ² with gradient w.r.t. latent.
-        
+
         Model output is detached, but latent remains in computation graph.
-        This matches the paper's approach where score is treated as a 
+        This matches the paper's approach where score is treated as a
         position-dependent field, not optimized through.
         """
         batch_size = latent.shape[0]
-        sigma_tensor = torch.full((batch_size,), sigma, device=self.device, dtype=latent.dtype)
-        
+        sigma_tensor = torch.full(
+            (batch_size,), sigma, device=self.device, dtype=latent.dtype
+        )
+
         with torch.no_grad():
             x_pred = self.model(latent, sigma_tensor, class_labels)
-        
-        return (x_pred - latent) / (sigma ** 2)
+
+        return (x_pred - latent) / (sigma**2)
 
     def _optimize_path_impl(
         self,
@@ -581,113 +758,113 @@ class SteinScoreInterpolator(BaseInterpolator):
         use_midpoint: bool = True,
         lr_min_ratio: float = 0.1,
         verbose: bool = True,
-        **kwargs
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Optimize geodesic using Stein Score Metric.
-        
+
         Energy (Eq. 8 from paper):
             E[γ] = (1/2) Σ [||v_i||² + λ(s(γ_i)^T v_i)²]
-        
+
         Args:
             lam: Penalty parameter λ controlling normal direction penalty.
                  Paper uses λ=1000 based on ablation study.
             use_midpoint: If True, evaluate score at segment midpoints (paper's approach).
         """
         batch_size = start_latent.shape[0]
-        
+
         # Initialize
         if init_with_slerp:
             path = self.slerp_interpolate(start_latent, end_latent, num_steps)
         else:
             path = self.linear_interpolate(start_latent, end_latent, num_steps)
-        
+
         if num_steps <= 2:
             return path, {"losses": [], "method": "stein_score"}
-        
+
         x0 = path[:, 0]
         x1 = path[:, -1]
         intermediate = path[:, 1:-1].clone().detach().requires_grad_(True)
-        
+
         n_inner = num_steps - 2
         n_segments = num_steps - 1
-        
+
         optimizer = torch.optim.Adam([intermediate], lr=lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=max_iters, eta_min=lr * lr_min_ratio
         )
-        
+
         # Prepare expanded class labels
         if class_label is not None:
             if class_label.numel() == 1:
                 cls_labels_seg = class_label.expand(batch_size * n_segments)
             else:
-                cls_labels_seg = class_label.unsqueeze(1).expand(-1, n_segments).reshape(-1)
+                cls_labels_seg = (
+                    class_label.unsqueeze(1).expand(-1, n_segments).reshape(-1)
+                )
         else:
             cls_labels_seg = None
-        
+
         losses = []
-        
+
         for iteration in range(max_iters):
             optimizer.zero_grad()
-            
+
             # Full path: [batch, num_steps, ...]
-            full_path = torch.cat([
-                x0.unsqueeze(1),
-                intermediate,
-                x1.unsqueeze(1)
-            ], dim=1)
-            
+            full_path = torch.cat(
+                [x0.unsqueeze(1), intermediate, x1.unsqueeze(1)], dim=1
+            )
+
             # Velocities: [batch, n_segments, ...]
             velocity = full_path[:, 1:] - full_path[:, :-1]
-            
+
             # Points for score evaluation
             if use_midpoint:
                 eval_points = 0.5 * (full_path[:, 1:] + full_path[:, :-1])
             else:
                 eval_points = full_path[:, :-1]
-              
+
             # Compute scores: [batch * n_segments, ...]
             eval_flat = eval_points.reshape(-1, *eval_points.shape[2:])
             scores_flat = self.compute_score_with_grad(eval_flat, sigma, cls_labels_seg)
             scores = scores_flat.view_as(velocity)
-            
+
             # Flatten spatial dims for dot product
-            vel_flat = velocity.flatten(start_dim=2)      # [batch, n_seg, D]
-            score_flat = scores.flatten(start_dim=2)      # [batch, n_seg, D]
-            
+            vel_flat = velocity.flatten(start_dim=2)  # [batch, n_seg, D]
+            score_flat = scores.flatten(start_dim=2)  # [batch, n_seg, D]
+
             # Stein energy: E = (1/2) Σ [||v||² + λ(s^T v)²]
-            euclidean_term = (vel_flat ** 2).sum(dim=-1)  # [batch, n_seg]
+            euclidean_term = (vel_flat**2).sum(dim=-1)  # [batch, n_seg]
             score_dot_vel = (score_flat * vel_flat).sum(dim=-1)  # [batch, n_seg]
-            score_term = lam * (score_dot_vel ** 2)       # [batch, n_seg]
-            
+            score_term = lam * (score_dot_vel**2)  # [batch, n_seg]
+
             energy = 0.5 * (euclidean_term + score_term).mean()
-            
+
             energy.backward()
             optimizer.step()
             scheduler.step()
-            
+
             losses.append(energy.item())
-            
+
             if verbose and iteration % 50 == 0:
                 euc_total = euclidean_term.sum().item()
                 score_total = score_term.sum().item()
-                print(f"Iter {iteration}: Energy = {energy.item():.4f} "
-                      f"(euc={euc_total:.4f}, score={score_total:.4f}), "
-                      f"lr = {scheduler.get_last_lr()[0]:.6f}")
-        
-        final_path = torch.cat([
-            x0.unsqueeze(1),
-            intermediate.detach(),
-            x1.unsqueeze(1)
-        ], dim=1)
-        
+                print(
+                    f"Iter {iteration}: Energy = {energy.item():.4f} "
+                    f"(euc={euc_total:.4f}, score={score_total:.4f}), "
+                    f"lr = {scheduler.get_last_lr()[0]:.6f}"
+                )
+
+        final_path = torch.cat(
+            [x0.unsqueeze(1), intermediate.detach(), x1.unsqueeze(1)], dim=1
+        )
+
         return final_path, {
             "losses": losses,
             "method": "stein_score",
             "sigma": sigma,
             "lambda": lam,
-            "iterations": max_iters
+            "iterations": max_iters,
         }
 
 
@@ -695,47 +872,47 @@ class RBFKernelInterpolator(BaseInterpolator):
     """
     RBF kernel-based geodesic interpolation using existing RiemannianMetric interface.
     """
-    
+
     def __init__(self, diffusion_model, autoencoder, device="cuda"):
         super().__init__(diffusion_model, autoencoder, device)
         self.h = None
         self.metric = None  # RiemannianMetric instance
         self._fitted = False
-    
+
     def fit(
-        self, 
-        latents: torch.Tensor, 
-        n_centers: int = 1000, 
+        self,
+        latents: torch.Tensor,
+        n_centers: int = 1000,
         kappa: float = 3.0,
-        normalize_iters: int = 30000
+        normalize_iters: int = 30000,
     ) -> "RBFKernelInterpolator":
         """Fit RBF metric from latent data."""
         lt_size = latents.shape[1:]
         latents_flat = latents.view(-1, np.prod(lt_size))
-        
+
         self.h = h_diag_RBF(
             n_centers=n_centers,
             latent_size=lt_size,
             ambiant_size=lt_size,
             data_to_fit_latent=latents_flat,
             data_to_fit_ambiant=latents_flat,
-            kappa=kappa
+            kappa=kappa,
         ).to(self.device)
-        
+
         if normalize_iters > 0:
             self.h.normalize(latents_flat.to(self.device))
 
         self.metric = load_metric("conf", "rbf", self.h)
         self._fitted = True
         return self
-    
+
     def load(self, h_path: str) -> "RBFKernelInterpolator":
         """Load pre-trained h_diag_RBF."""
-        self.h = torch.load(h_path, map_location=self.device,weights_only=False)
+        self.h = torch.load(h_path, map_location=self.device, weights_only=False)
         self.metric = load_metric("conf", "rbf", self.h)
         self._fitted = True
         return self
-    
+
     def _optimize_path_impl(
         self,
         start_latent: torch.Tensor,
@@ -743,54 +920,54 @@ class RBFKernelInterpolator(BaseInterpolator):
         num_steps: int = 10,
         lr: float = 0.01,
         max_iters: int = 2000,
-        **kwargs
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Optimize geodesic path minimizing Riemannian kinetic energy."""
         if not self._fitted:
             raise RuntimeError("Call fit() or load() first")
-        
+
         path = self.linear_interpolate(start_latent, end_latent, num_steps)
-        print(f'[DEBUG] RBFInterpolator: linear interpolate path shape: {path.shape}')
+        print(f"[DEBUG] RBFInterpolator: linear interpolate path shape: {path.shape}")
         if num_steps <= 2:
             return path, {"losses": [], "method": "rbf_conformal"}
-        
+
         intermediate = path[:, 1:-1].clone().detach().requires_grad_(True)
         optimizer = torch.optim.Adam([intermediate], lr=lr)
-        
+
         losses = []
         dt = 1.0 / (num_steps - 1)
-        
+
         for iteration in range(max_iters):
             optimizer.zero_grad()
-            
-            full_path = torch.cat([
-                start_latent.unsqueeze(1),
-                intermediate,
-                end_latent.unsqueeze(1)
-            ], dim=1)
+
+            full_path = torch.cat(
+                [start_latent.unsqueeze(1), intermediate, end_latent.unsqueeze(1)],
+                dim=1,
+            )
 
             velocity = (full_path[:, 1:] - full_path[:, :-1]) / dt
             midpoints = 0.5 * (full_path[:, 1:] + full_path[:, :-1])
-            energy = self.metric.kinetic(midpoints, velocity).mean()*dt
-            
+            energy = self.metric.kinetic(midpoints, velocity).mean() * dt
+
             loss = energy
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
-            
+
             if iteration % 20 == 0:
                 print(f"Iter {iteration}: loss={loss.item():.4f}")
                 with torch.no_grad():
                     g_values = self.metric.g_fast(midpoints)  # = 1/h(x)
-                    print(f"g: min={g_values.min():.2f}, max={g_values.max():.2f}, mean={g_values.mean():.2f}")
+                    print(
+                        f"g: min={g_values.min():.2f}, max={g_values.max():.2f}, mean={g_values.mean():.2f}"
+                    )
                     print(f"grad norm: {intermediate.grad.norm().item():.6f}")
-        
-        final_path = torch.cat([
-            start_latent.unsqueeze(1),
-            intermediate.detach(),
-            end_latent.unsqueeze(1)
-        ], dim=1)
-        
+
+        final_path = torch.cat(
+            [start_latent.unsqueeze(1), intermediate.detach(), end_latent.unsqueeze(1)],
+            dim=1,
+        )
+
         return final_path, {"losses": losses, "method": "rbf_conformal"}
 
 
@@ -798,32 +975,32 @@ class LandInterpolator(BaseInterpolator):
     """
     Landmark-based geodesic interpolation using h_diag_Land metric.
     """
-    
+
     def __init__(self, diffusion_model, autoencoder, device="cuda"):
         super().__init__(diffusion_model, autoencoder, device)
         self.h = None
         self.metric = None
         self._fitted = False
-    
+
     def fit(
-        self, 
-        latents: torch.Tensor, 
-        n_reference: int = 1000, 
+        self,
+        latents: torch.Tensor,
+        n_reference: int = 1000,
         gamma: float = None,  # None = data-driven
-        normalize_iters: int = 3000
+        normalize_iters: int = 3000,
     ) -> "LandInterpolator":
         """Fit Land metric from latent data."""
         from gfm.path.metrics import h_diag_Land
-        
+
         lt_size = latents.shape[1:]
         latents_flat = latents.view(-1, np.prod(lt_size)).to(self.device)
-        
+
         n_total = latents_flat.shape[0]
         assert n_total > n_reference, f"Need more than {n_reference} samples"
-        
+
         data_ref = latents_flat[:n_reference]
         data_to_fit = latents_flat[n_reference:]
-        
+
         # Data-driven gamma
         if gamma is None:
             with torch.no_grad():
@@ -832,23 +1009,23 @@ class LandInterpolator(BaseInterpolator):
                 mask = ~torch.eye(n_sample, dtype=bool, device=self.device)
                 gamma = sample_dists[mask].median().item() / 3
                 print(f"[LandInterpolator] Data-driven gamma: {gamma:.2f}")
-        
+
         self.h = h_diag_Land(data_ref, gamma=gamma).to(self.device)
-        
+
         if normalize_iters > 0:
             self.h.normalize(data_to_fit)
 
         self.metric = load_metric("diag", "land", self.h)
         self._fitted = True
         return self
-    
+
     def load(self, h_path: str) -> "LandInterpolator":
         """Load pre-trained h_diag_Land."""
         self.h = torch.load(h_path, map_location=self.device, weights_only=False)
         self.metric = load_metric("diag", "land", self.h)
         self._fitted = True
         return self
-    
+
     def _optimize_path_impl(
         self,
         start_latent: torch.Tensor,
@@ -856,66 +1033,68 @@ class LandInterpolator(BaseInterpolator):
         num_steps: int = 10,
         lr: float = 0.01,
         max_iters: int = 400,
-        **kwargs
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Optimize geodesic path minimizing Riemannian kinetic energy."""
         if not self._fitted:
             raise RuntimeError("Call fit() or load() first")
-        
+
         path = self.linear_interpolate(start_latent, end_latent, num_steps)
-        print(f'[DEBUG] LandInterpolator: linear interpolate path shape: {path.shape}')
+        print(f"[DEBUG] LandInterpolator: linear interpolate path shape: {path.shape}")
         if num_steps <= 2:
             return path, {"losses": [], "method": "land_diagonal"}
 
         intermediate = path[:, 1:-1].clone().detach().requires_grad_(True)
         optimizer = torch.optim.Adam([intermediate], lr=lr)
-        
+
         losses = []
         dt = 1.0 / (num_steps - 1)
-        
+
         for iteration in range(max_iters):
             optimizer.zero_grad()
-            
-            full_path = torch.cat([
-                start_latent.unsqueeze(1),
-                intermediate,
-                end_latent.unsqueeze(1)
-            ], dim=1)
-            
+
+            full_path = torch.cat(
+                [start_latent.unsqueeze(1), intermediate, end_latent.unsqueeze(1)],
+                dim=1,
+            )
+
             velocity = (full_path[:, 1:] - full_path[:, :-1]) / dt
             midpoints = 0.5 * (full_path[:, 1:] + full_path[:, :-1])
             energy = self.metric.kinetic(midpoints, velocity).mean() * dt
-            
+
             loss = energy
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
-            
+
             if iteration % 20 == 0:
                 print(f"Iter {iteration}: loss={loss.item():.4f}")
                 with torch.no_grad():
                     g_values = self.metric.g_fast(midpoints)
-                    
+
                     if iteration == 0:
                         init_intermediate = intermediate.clone().detach()
                         init_g = g_values.clone().clone().detach()
 
                     disp = (intermediate - init_intermediate).abs()
-                    print(f"intermediate displacement: mean={disp.mean():.6f}, max={disp.max():.6f}")
+                    print(
+                        f"intermediate displacement: mean={disp.mean():.6f}, max={disp.max():.6f}"
+                    )
 
                     g_diff = (g_values - init_g).abs()
                     print(f"g change: mean={g_diff.mean():.6f}, max={g_diff.max():.6f}")
-        
-        final_path = torch.cat([
-            start_latent.unsqueeze(1),
-            intermediate.detach(),
-            end_latent.unsqueeze(1)
-        ], dim=1)
-        
+
+        final_path = torch.cat(
+            [start_latent.unsqueeze(1), intermediate.detach(), end_latent.unsqueeze(1)],
+            dim=1,
+        )
+
         return final_path, {"losses": losses, "method": "land_diagonal"}
+
 
 class SphericalInterpolator(BaseInterpolator):
     """Geodesic interpolation on a sphere."""
+
     def __init__(self, diffusion_model, autoencoder, device):
         super().__init__(diffusion_model, autoencoder, device)
 
@@ -925,38 +1104,42 @@ class SphericalInterpolator(BaseInterpolator):
         """Spherical linear interpolation (paper recommends for initialization)."""
         original_shape = start_latent.shape
         batch_size = original_shape[0]
-        
+
         # Flatten to [batch, D]
         start_flat = start_latent.view(batch_size, -1)
         end_flat = end_latent.view(batch_size, -1)
-        
+
         # Unit vectors and norms
         start_norm = start_flat.norm(dim=-1, keepdim=True)
         end_norm = end_flat.norm(dim=-1, keepdim=True)
         start_unit = start_flat / (start_norm + 1e-8)
         end_unit = end_flat / (end_norm + 1e-8)
-        
+
         # Angle
-        cos_theta = (start_unit * end_unit).sum(dim=-1, keepdim=True).clamp(-1 + 1e-7, 1 - 1e-7)
+        cos_theta = (
+            (start_unit * end_unit).sum(dim=-1, keepdim=True).clamp(-1 + 1e-7, 1 - 1e-7)
+        )
         theta = torch.acos(cos_theta)
         sin_theta = torch.sin(theta)
-        
+
         # Interpolation
         t = torch.linspace(0, 1, num_steps, device=self.device).view(1, num_steps, 1)
         w0 = torch.sin((1 - t) * theta.unsqueeze(1)) / (sin_theta.unsqueeze(1) + 1e-8)
         w1 = torch.sin(t * theta.unsqueeze(1)) / (sin_theta.unsqueeze(1) + 1e-8)
-        
+
         # Fall back to linear for small angles
         small_angle = sin_theta.unsqueeze(1).abs() < 1e-6
         w0 = torch.where(small_angle, 1 - t, w0)
         w1 = torch.where(small_angle, t, w1)
-        
+
         # Interpolate direction and norm
         norm_interp = start_norm.unsqueeze(1) * (1 - t) + end_norm.unsqueeze(1) * t
         interp_unit = w0 * start_unit.unsqueeze(1) + w1 * end_unit.unsqueeze(1)
         interp_unit = interp_unit / (interp_unit.norm(dim=-1, keepdim=True) + 1e-8)
-        
-        return (interp_unit * norm_interp).view(batch_size, num_steps, *original_shape[1:])
+
+        return (interp_unit * norm_interp).view(
+            batch_size, num_steps, *original_shape[1:]
+        )
 
     def _optimize_path_impl(
         self,
@@ -964,48 +1147,50 @@ class SphericalInterpolator(BaseInterpolator):
         end_latent: torch.Tensor,
         num_steps: int = 10,
         init_with_slerp: bool = True,
-        **kwargs
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         if init_with_slerp:
             path = self.slerp_interpolate(start_latent, end_latent, num_steps)
         else:
             path = self.linear_interpolate(start_latent, end_latent, num_steps)
-        return path
+        return path, {}
+
+
 # Backward compatibility aliases
 class EL2Interpolator(BaseInterpolator):
     """
     Euler-Lagrange Interpolator: Geodesic on sphere with score-based force.
-    
+
     Minimizes: ||acc_geodesic + λ * force_tangent||²
     """
-    
+
     def slerp_interpolate(
         self, start_latent: torch.Tensor, end_latent: torch.Tensor, num_steps: int
     ) -> torch.Tensor:
         """Standard SLERP for initialization."""
         original_shape = start_latent.shape
         batch_size = original_shape[0]
-        
+
         start_flat = start_latent.view(batch_size, -1)
         end_flat = end_latent.view(batch_size, -1)
-        
+
         start_norm = start_flat.norm(dim=-1, keepdim=True)
         end_norm = end_flat.norm(dim=-1, keepdim=True)
         dot = (start_flat * end_flat).sum(dim=-1, keepdim=True)
-        
+
         cos_omega = (dot / (start_norm * end_norm + 1e-8)).clamp(-1 + 1e-7, 1 - 1e-7)
         omega = torch.acos(cos_omega)
         sin_omega = torch.sin(omega)
-        
+
         t = torch.linspace(0, 1, num_steps, device=self.device).view(1, num_steps, 1)
-        
+
         s0 = torch.sin((1 - t) * omega.unsqueeze(1)) / (sin_omega.unsqueeze(1) + 1e-8)
         s1 = torch.sin(t * omega.unsqueeze(1)) / (sin_omega.unsqueeze(1) + 1e-8)
-        
+
         small_angle = sin_omega.unsqueeze(1).abs() < 1e-6
         s0 = torch.where(small_angle, 1 - t, s0)
         s1 = torch.where(small_angle, t, s1)
-        
+
         result_flat = s0 * start_flat.unsqueeze(1) + s1 * end_flat.unsqueeze(1)
         return result_flat.view(batch_size, num_steps, *original_shape[1:])
 
@@ -1014,13 +1199,13 @@ class EL2Interpolator(BaseInterpolator):
         """Project vector v onto tangent space of sphere at point x."""
         x_flat = x.flatten(start_dim=1)
         v_flat = v.flatten(start_dim=1)
-        
+
         dot = (v_flat * x_flat).sum(dim=-1, keepdim=True)
         x_norm_sq = (x_flat * x_flat).sum(dim=-1, keepdim=True)
-        
+
         normal_component = (dot / (x_norm_sq + 1e-8)) * x_flat
         tangent_v = v_flat - normal_component
-        
+
         return tangent_v.view_as(v)
 
     def _optimize_path_impl(
@@ -1034,71 +1219,109 @@ class EL2Interpolator(BaseInterpolator):
         class_label: Optional[torch.Tensor] = None,
         lam: float = 1.0,
         verbose: bool = True,
-        **kwargs
+        snapshot_iters: Optional[List[int]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Optimize geodesic on sphere with score-based force."""
         batch_size = start_latent.shape[0]
-        
+
         path = self.slerp_interpolate(start_latent, end_latent, num_steps)
-        
+
         if num_steps <= 2:
             return path, {"losses": [], "method": "euler_lagrange"}
-        
+
         x0 = path[:, 0]
         x1 = path[:, -1]
         x_inner = path[:, 1:-1].clone().detach().requires_grad_(True)
-        
+
+        snap_set = set(snapshot_iters or [])
+        snapshots: Dict[int, torch.Tensor] = {}
+
         dt = 1.0 / (num_steps - 1)
         n_inner = num_steps - 2
-        
+
         optimizer = torch.optim.Adam([x_inner], lr=lr, eps=1e-5)
         losses = []
-        
+        acc_norms: List[float] = []
+        f_norms: List[float] = []
+
         # Prepare expanded class labels once (for n_inner points per batch)
         if class_label is not None:
             if class_label.numel() == 1:
                 cls_labels_expanded = class_label.expand(batch_size * n_inner)
             else:
-                cls_labels_expanded = class_label.unsqueeze(1).expand(-1, n_inner).reshape(-1)
+                cls_labels_expanded = (
+                    class_label.unsqueeze(1).expand(-1, n_inner).reshape(-1)
+                )
         else:
             cls_labels_expanded = None
-        
+
         for iteration in range(max_iters):
             optimizer.zero_grad()
-            
+
             full_path = torch.cat([x0.unsqueeze(1), x_inner, x1.unsqueeze(1)], dim=1)
-            
+
             # Geodesic acceleration
-            acc_euclidean = (full_path[:, 2:] - 2 * full_path[:, 1:-1] + full_path[:, :-2]) / (dt ** 2)
+            acc_euclidean = (
+                full_path[:, 2:] - 2 * full_path[:, 1:-1] + full_path[:, :-2]
+            ) / (dt**2)
             x_mid = full_path[:, 1:-1].reshape(-1, *full_path.shape[2:])
             acc_flat = acc_euclidean.reshape(-1, *acc_euclidean.shape[2:])
             acc_geodesic = acc_euclidean
-            
+
             # Reuse compute_force from BaseInterpolator
             x_inner_flat = x_inner.reshape(-1, *x_inner.shape[2:])
-            force_euclidean = self.compute_force(x_inner_flat, sigma, cls_labels_expanded)
-            
+            force_euclidean = self.compute_force(
+                x_inner_flat, sigma, cls_labels_expanded
+            )
+
             # Project force to tangent space
             force_tangent = force_euclidean
-            
+
+            if iteration in snap_set:
+                snapshots[iteration] = torch.cat(
+                    [x0.unsqueeze(1), x_inner.detach().clone(), x1.unsqueeze(1)],
+                    dim=1,
+                )
+
             # Loss
             loss = ((acc_geodesic + lam * force_tangent) ** 2).mean()
-            
+
+            with torch.no_grad():
+                acc_rms = acc_geodesic.pow(2).mean().sqrt().item()
+                f_rms = force_tangent.pow(2).mean().sqrt().item()
+            acc_norms.append(acc_rms)
+            f_norms.append(f_rms)
+
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
-            
+
             if verbose and iteration % 20 == 0:
-                print(f"Iter {iteration}: loss = {loss.item():.6f}")
-        
-        final_path = torch.cat([x0.unsqueeze(1), x_inner.detach(), x1.unsqueeze(1)], dim=1)
-        
+                lam_f_rms = lam * f_rms
+                ratio = lam_f_rms / (acc_rms + 1e-12)
+                print(
+                    f"Iter {iteration}: loss = {loss.item():.6f} | "
+                    f"||acc||={acc_rms:.4g}  ||λf||={lam_f_rms:.4g}  "
+                    f"(||f||={f_rms:.4g}, λf/acc={ratio:.3g})"
+                )
+
+        final_path = torch.cat(
+            [x0.unsqueeze(1), x_inner.detach(), x1.unsqueeze(1)], dim=1
+        )
+        snapshots[max_iters] = final_path
+
         return final_path, {
             "losses": losses,
+            "acc_norms": acc_norms,
+            "f_norms": f_norms,
             "method": "euler_lagrange2",
             "sigma": sigma,
             "lambda": lam,
-            "iterations": max_iters
+            "iterations": max_iters,
+            "snapshots": snapshots,
         }
+
+
 GeodesicInterpolator = ScoreBasedInterpolator
 RBFInterpolator = RBFKernelInterpolator

@@ -9,3 +9,4 @@ results/
 test_outputs/
 __pycache__/
 *.pyc
+edm2/

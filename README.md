@@ -15,6 +15,18 @@
 <tr>
 <td><img src="imgs/anakin_slerp.png" width="100%"></td>
 </tr>
+<tr>
+<td align="center"><b>GFM (ours)</b></td>
+</tr>
+<tr>
+<td><img src="imgs/cake_burger_gfm.png" width="100%"></td>
+</tr>
+<tr>
+<td align="center"><b>SLERP baseline</b></td>
+</tr>
+<tr>
+<td><img src="imgs/cake_burger_slerp.png" width="100%"></td>
+</tr>
 </table>
 
 ## Installation

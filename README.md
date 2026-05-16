@@ -1,6 +1,21 @@
-# GFM: Geodesic Flow Matching on Learned Latent Spaces
+# GFM: Geodesic Force Matching on Learned Latent Spaces
 
 **Official PyTorch Implementation**
+
+<table>
+<tr>
+<td align="center"><b>GFM (ours)</b></td>
+</tr>
+<tr>
+<td><img src="imgs/anakin_gfm.png" width="100%"></td>
+</tr>
+<tr>
+<td align="center"><b>SLERP baseline</b></td>
+</tr>
+<tr>
+<td><img src="imgs/anakin_slerp.png" width="100%"></td>
+</tr>
+</table>
 
 ## Installation
 

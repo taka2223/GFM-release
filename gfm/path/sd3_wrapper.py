@@ -532,6 +532,7 @@ def run_gfm_interpolation(
     output_frames: int = 10,
     mode: str = "nfsd",
     snapshot_iters: Optional[List[int]] = None,
+    method: str = "gfm",
 ) -> Dict[str, Any]:
     from gfm.path.geodesic_interpolation import (
         ELInterpolator,
@@ -591,13 +592,21 @@ def run_gfm_interpolation(
     # from gfm.path.diag import ScoreDiagnostics
     # diag = ScoreDiagnostics(sd3_pipe)
     # diag.run_all(latA_noisy, latB_noisy, sigma_eff)
-    # 6. Run GFM
-    print(f"Running GFM (steps={num_steps}, λ={lam}, iters={max_iters})...")
-    interpolator = EL2Interpolator(
-        diffusion_model=sd3_pipe.model,
-        autoencoder=sd3_pipe.autoencoder,
-        device=str(device),
-    )
+    # 6. Path construction (GFM optimization or SLERP baseline)
+    if method == "slerp":
+        print(f"Running SLERP baseline (steps={num_steps}, no optimization)...")
+        interpolator = SphericalInterpolator(
+            diffusion_model=sd3_pipe.model,
+            autoencoder=sd3_pipe.autoencoder,
+            device=str(device),
+        )
+    else:
+        print(f"Running GFM (steps={num_steps}, λ={lam}, iters={max_iters})...")
+        interpolator = EL2Interpolator(
+            diffusion_model=sd3_pipe.model,
+            autoencoder=sd3_pipe.autoencoder,
+            device=str(device),
+        )
 
     # interpolator = SteinScoreInterpolator(
     #     diffusion_model=sd3_pipe.model,

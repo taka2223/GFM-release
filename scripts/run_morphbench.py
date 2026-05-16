@@ -77,6 +77,13 @@ def parse_args():
     p.add_argument("--resolution", type=int, default=512)
     p.add_argument("--keep_t5", action="store_true")
     p.add_argument(
+        "--method",
+        type=str,
+        default="gfm",
+        choices=["gfm", "slerp"],
+        help="gfm = full optimization; slerp = baseline (no optimization)",
+    )
+    p.add_argument(
         "--limit", type=int, default=0, help="Stop after N pairs (debug)"
     )
     p.add_argument("--overwrite", action="store_true")
@@ -149,6 +156,7 @@ def main():
             lr=args.lr,
             max_iters=args.max_iters,
             mode="nfsd",
+            method=args.method,
         )
 
         save_interpolation_strip(

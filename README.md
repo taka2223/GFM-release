@@ -1,4 +1,4 @@
-# GFM: Geodesic Force Matching on Learned Latent Spaces
+# What Makes a Good Path? Factoring Manifold Support and Path Geometry
 
 **Official PyTorch Implementation**
 
@@ -41,7 +41,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/anonymous/GFM-release.git
+git clone https://github.com/taka2223/GFM-release.git
 cd GFM-release
 
 # Install dependencies

@@ -7,6 +7,7 @@
 
 import builtins
 import datetime
+from math import inf
 import os
 import time
 from collections import defaultdict, deque
@@ -14,7 +15,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch._six import inf
 
 
 class SmoothedValue(object):

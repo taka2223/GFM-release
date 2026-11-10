@@ -1,124 +1,244 @@
-"""Compute FID(generated middle frames || endpoint images).
+"""Compute MorphBench FID for GFM and SLERP on identical completed pairs.
 
-For each <out_root>/<subset>/<name>/frames/:
-  reference   <- frame_000.png + frame_009.png   (the input endpoints, passed through)
-  generated   <- frame_001.png ... frame_008.png (8 inner interpolated frames)
-
-Reports FID per subset and global.
-
-Usage:
-    python scripts/eval_fid.py --out_root ./output/morphbench_sd3
+The reference distribution contains the two endpoint images from every pair;
+following the MorphBench protocol, two distinct interior frames per sequence
+are sampled in each of ten repeats.  Inception features are extracted once and
+reused for every repeat, subset, and method.  The same sampled frame indices
+are used for GFM and SLERP.  Results are saved to
+``<out_root>/fid_summary.json``.
 """
 
-import os
-import sys
 import argparse
 import glob
-import shutil
-import tempfile
-from typing import List, Tuple
+import json
+import os
+from typing import Dict, List, Tuple
+
+import numpy as np
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--out_root", type=str, default="./output/morphbench_sd3")
-    p.add_argument(
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out_root", default="./output/morphbench_sd3")
+    parser.add_argument("--methods", nargs="+", default=["gfm", "slerp"])
+    parser.add_argument(
         "--subsets",
-        type=str,
         nargs="+",
         default=["Metamorphosis", "Animation"],
     )
-    p.add_argument("--device", type=str, default="cuda")
-    return p.parse_args()
+    parser.add_argument("--expected_frames", type=int, default=17)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--dims", type=int, default=2048, choices=[64, 192, 768, 2048])
+    parser.add_argument("--fid_repeats", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=20260727)
+    return parser.parse_args()
 
 
-def collect_frames(out_root: str, subsets: List[str]) -> List[Tuple[str, str, List[str], List[str]]]:
-    """For each (subset, pair), return (ref_paths, gen_paths)."""
-    out = []
-    for subset in subsets:
-        sd = os.path.join(out_root, subset)
-        if not os.path.isdir(sd):
-            continue
-        for name in sorted(os.listdir(sd)):
-            fdir = os.path.join(sd, name, "frames")
-            if not os.path.isdir(fdir):
+def discover(
+    out_root: str,
+    methods: List[str],
+    subsets: List[str],
+    expected_frames: int,
+) -> Tuple[List[Tuple[str, str]], Dict[Tuple[str, str, str], List[str]]]:
+    frames_by_key: Dict[Tuple[str, str, str], List[str]] = {}
+    for method in methods:
+        for subset in subsets:
+            subset_dir = os.path.join(out_root, method, subset)
+            if not os.path.isdir(subset_dir):
                 continue
-            paths = sorted(glob.glob(os.path.join(fdir, "frame_*.png")))
-            if len(paths) < 3:
-                continue
-            ref = [paths[0], paths[-1]]
-            gen = paths[1:-1]
-            out.append((subset, name, ref, gen))
-    return out
+            for name in sorted(os.listdir(subset_dir)):
+                frame_dir = os.path.join(subset_dir, name, "frames")
+                paths = sorted(glob.glob(os.path.join(frame_dir, "frame_*.png")))
+                if len(paths) == expected_frames:
+                    frames_by_key[(method, subset, name)] = paths
+
+    common_pairs = sorted(
+        {
+            (subset, name)
+            for method, subset, name in frames_by_key
+            if all((candidate, subset, name) in frames_by_key for candidate in methods)
+        }
+    )
+    return common_pairs, frames_by_key
 
 
-def stage(paths: List[str], dst_dir: str, prefix: str):
-    os.makedirs(dst_dir, exist_ok=True)
-    for i, p in enumerate(paths):
-        link = os.path.join(dst_dir, f"{prefix}_{i:05d}.png")
-        if not os.path.exists(link):
-            os.symlink(os.path.abspath(p), link)
+def frechet_distance_from_features(
+    reference: np.ndarray,
+    generated: np.ndarray,
+) -> float:
+    """Exact empirical FID without a dense feature-by-feature square root.
+
+    If A and B contain centered samples scaled by their covariance
+    denominators, the Bures covariance cross term is the nuclear norm of
+    A @ B.T.  MorphBench has far fewer samples than Inception dimensions, so
+    this sample-space form replaces a 2048x2048 matrix square root with an
+    SVD whose largest dimension is the number of images.
+    """
+    if reference.shape[0] < 2 or generated.shape[0] < 2:
+        raise ValueError("FID requires at least two samples per distribution")
+    reference = np.asarray(reference, dtype=np.float64)
+    generated = np.asarray(generated, dtype=np.float64)
+    mean_difference = reference.mean(axis=0) - generated.mean(axis=0)
+    centered_reference = (
+        reference - reference.mean(axis=0, keepdims=True)
+    ) / np.sqrt(reference.shape[0] - 1)
+    centered_generated = (
+        generated - generated.mean(axis=0, keepdims=True)
+    ) / np.sqrt(generated.shape[0] - 1)
+    covariance_trace = (
+        np.square(centered_reference).sum()
+        + np.square(centered_generated).sum()
+    )
+    cross = centered_reference @ centered_generated.T
+    cross_trace = np.linalg.svd(cross, compute_uv=False).sum()
+    distance = (
+        np.dot(mean_difference, mean_difference)
+        + covariance_trace
+        - 2.0 * cross_trace
+    )
+    return float(max(distance, 0.0))
 
 
 def main():
     args = parse_args()
-    import pyiqa
+    from pytorch_fid.fid_score import get_activations
+    from pytorch_fid.inception import InceptionV3
 
-    print(f"Loading FID metric...")
-    fid = pyiqa.create_metric("fid").to(args.device)
+    common_pairs, frames_by_key = discover(
+        args.out_root,
+        args.methods,
+        args.subsets,
+        args.expected_frames,
+    )
+    if not common_pairs:
+        raise RuntimeError("No complete pairs shared by all requested methods")
+    print(f"Common complete pairs: {len(common_pairs)}", flush=True)
 
-    pairs = collect_frames(args.out_root, args.subsets)
-    print(f"Found {len(pairs)} pairs total")
-    if not pairs:
-        return
+    # Endpoint frames are copied verbatim by the pipeline, so one method is a
+    # sufficient source for the shared reference distribution.
+    endpoint_files = []
+    endpoint_pair_indices = []
+    for pair_index, (subset, name) in enumerate(common_pairs):
+        paths = frames_by_key[(args.methods[0], subset, name)]
+        endpoint_files.extend([paths[0], paths[-1]])
+        endpoint_pair_indices.extend([pair_index, pair_index])
 
-    base_tmp = tempfile.mkdtemp(prefix="fid_stage_")
-    print(f"Staging frames in {base_tmp}")
+    interior_files_by_method = {}
+    interior_pair_indices_by_method = {}
+    for method in args.methods:
+        files = []
+        pair_indices = []
+        for pair_index, (subset, name) in enumerate(common_pairs):
+            interior = frames_by_key[(method, subset, name)][1:-1]
+            files.extend(interior)
+            pair_indices.extend([pair_index] * len(interior))
+        interior_files_by_method[method] = files
+        interior_pair_indices_by_method[method] = np.asarray(pair_indices)
 
-    by_subset = {}
-    for subset, name, ref, gen in pairs:
-        by_subset.setdefault(subset, []).append((name, ref, gen))
+    block_index = InceptionV3.BLOCK_INDEX_BY_DIM[args.dims]
+    model = InceptionV3([block_index]).to(args.device).eval()
+    print(f"Extracting {len(endpoint_files)} endpoint activations...", flush=True)
+    endpoint_features = get_activations(
+        endpoint_files,
+        model,
+        args.batch_size,
+        args.dims,
+        args.device,
+        args.num_workers,
+    )
+    features_by_method = {}
+    for method in args.methods:
+        files = interior_files_by_method[method]
+        print(f"Extracting {len(files)} interior activations for {method}...", flush=True)
+        features_by_method[method] = get_activations(
+            files,
+            model,
+            args.batch_size,
+            args.dims,
+            args.device,
+            args.num_workers,
+        )
 
-    results = {}
-    for subset, items in by_subset.items():
-        ref_dir = os.path.join(base_tmp, f"{subset}_ref")
-        gen_dir = os.path.join(base_tmp, f"{subset}_gen")
-        for name, ref, gen in items:
-            stage(ref, ref_dir, f"{name}_ref")
-            stage(gen, gen_dir, f"{name}_gen")
-        n_ref = len(glob.glob(os.path.join(ref_dir, "*.png")))
-        n_gen = len(glob.glob(os.path.join(gen_dir, "*.png")))
-        print(f"[{subset}] computing FID over {n_gen} gen vs {n_ref} ref ...")
-        score = fid(gen_dir, ref_dir).item()
-        print(f"  {subset}  FID = {score:.3f}")
-        results[subset] = (score, n_gen, n_ref)
+    endpoint_pair_indices = np.asarray(endpoint_pair_indices)
+    n_interior = args.expected_frames - 2
+    if n_interior < 2:
+        raise ValueError("--expected_frames must leave at least two interior frames")
+    rng = np.random.default_rng(args.seed)
+    # Argsort gives two different positions without a Python loop.  Sampling
+    # positions are shared across methods for a paired comparison.
+    sampled_positions = np.argsort(
+        rng.random((args.fid_repeats, len(common_pairs), n_interior)),
+        axis=2,
+    )[:, :, :2]
+    results = {
+        "protocol": {
+            "reference": "both endpoint frames from every complete pair",
+            "generated": (
+                "two distinct interior frames sampled per sequence in each repeat"
+            ),
+            "fid_repeats": args.fid_repeats,
+            "random_seed": args.seed,
+            "same_sampled_positions_across_methods": True,
+            "expected_frames_per_sequence": args.expected_frames,
+            "inception_dimensions": args.dims,
+            "common_pairs_only": True,
+        },
+        "scores": {},
+    }
+    scopes = [*args.subsets, "ALL"]
+    for scope in scopes:
+        selected_pairs = np.asarray(
+            [
+                index
+                for index, (subset, _name) in enumerate(common_pairs)
+                if scope == "ALL" or subset == scope
+            ],
+            dtype=np.int64,
+        )
+        if not selected_pairs.size:
+            continue
+        endpoint_mask = np.isin(endpoint_pair_indices, selected_pairs)
+        reference_features = endpoint_features[endpoint_mask]
+        results["scores"][scope] = {}
+        for method in args.methods:
+            method_features = features_by_method[method].reshape(
+                len(common_pairs), n_interior, args.dims
+            )
+            repeat_scores = []
+            for repeat in range(args.fid_repeats):
+                positions = sampled_positions[repeat, selected_pairs]
+                generated = method_features[
+                    selected_pairs[:, None],
+                    positions,
+                ].reshape(-1, args.dims)
+                repeat_scores.append(
+                    frechet_distance_from_features(
+                        reference_features,
+                        generated,
+                    )
+                )
+            scores = np.asarray(repeat_scores, dtype=np.float64)
+            results["scores"][scope][method] = {
+                "fid_mean": float(scores.mean()),
+                "fid_std": float(scores.std(ddof=1)) if scores.size > 1 else 0.0,
+                "fid_repeats": repeat_scores,
+                "n_pairs": int(selected_pairs.size),
+                "n_reference": int(endpoint_mask.sum()),
+                "n_generated_per_repeat": int(2 * selected_pairs.size),
+            }
+            print(
+                f"{scope:13s} {method:5s}: "
+                f"FID={scores.mean():.4f} +/- {scores.std(ddof=1):.4f} "
+                f"(ref={endpoint_mask.sum()}, generated/repeat={2 * selected_pairs.size})",
+                flush=True,
+            )
 
-    # global
-    all_ref = os.path.join(base_tmp, "ALL_ref")
-    all_gen = os.path.join(base_tmp, "ALL_gen")
-    for subset, items in by_subset.items():
-        for name, ref, gen in items:
-            stage(ref, all_ref, f"{subset}_{name}_ref")
-            stage(gen, all_gen, f"{subset}_{name}_gen")
-    n_ref = len(glob.glob(os.path.join(all_ref, "*.png")))
-    n_gen = len(glob.glob(os.path.join(all_gen, "*.png")))
-    print(f"[ALL] computing FID over {n_gen} gen vs {n_ref} ref ...")
-    score_all = fid(all_gen, all_ref).item()
-    print(f"  ALL  FID = {score_all:.3f}")
-    results["ALL"] = (score_all, n_gen, n_ref)
-
-    csv_path = os.path.join(args.out_root, "fid.csv")
-    with open(csv_path, "w") as f:
-        f.write("subset,FID,n_gen,n_ref\n")
-        for k, (s, ng, nr) in results.items():
-            f.write(f"{k},{s:.4f},{ng},{nr}\n")
-    print(f"\nSaved {csv_path}")
-
-    # cleanup staging
-    try:
-        shutil.rmtree(base_tmp)
-    except Exception:
-        pass
+    output_path = os.path.join(args.out_root, "fid_summary.json")
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(results, handle, indent=2)
+    print(f"Saved {output_path}", flush=True)
 
 
 if __name__ == "__main__":

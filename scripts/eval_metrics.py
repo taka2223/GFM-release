@@ -1,171 +1,261 @@
-"""Compute PPL / PDV / TOPIQ over MorphBench GFM outputs.
+"""Evaluate MorphBench path length and transition uniformity with LPIPS.
 
-For each <out_root>/<subset>/<name>/frames/ directory containing 10 frame_*.png,
-compute:
-  PPL  = sum_i LPIPS(x_i, x_{i+1})           (path length)
-  PDV  = std_i  LPIPS(x_i, x_{i+1})           (rate consistency)
-  TOPIQ = mean_i TOPIQ_NR(x_i)                (per-frame quality)
+For adjacent-frame LPIPS distances d_i, this script records:
 
-Outputs:
-  <out_root>/metrics.csv     (per-pair rows + per-subset means + global mean)
+    PPL      = sum_i d_i
+    PDV-var  = population variance_i(d_i)
+    PDV-std  = population standard deviation_i(d_i)
 
-Usage:
-  pip install pyiqa
-  python scripts/eval_metrics.py --out_root ./output/morphbench_sd3
+Both PDV conventions are retained because image-morphing papers have described
+PDV as variance while some implementations report its square root.  Outputs
+are written to ``<out_root>/lpips_per_pair.csv`` and
+``<out_root>/lpips_summary.json``.
 """
 
-import os
 import argparse
 import csv
 import glob
-import statistics
-from typing import List
+import json
+import os
+from collections import defaultdict
+from typing import Dict, List
 
+import numpy as np
 import torch
-from PIL import Image
 import torchvision.transforms.functional as TF
+from PIL import Image
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out_root", default="./output/morphbench_sd3")
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        default=["gfm", "slerp"],
+    )
+    parser.add_argument(
+        "--subsets",
+        nargs="+",
+        default=["Metamorphosis", "Animation"],
+    )
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--lpips_backbone", choices=["alex", "vgg"], default="alex")
+    parser.add_argument("--expected_frames", type=int, default=17)
+    parser.add_argument("--bootstrap_repeats", type=int, default=10000)
+    parser.add_argument("--seed", type=int, default=20260727)
+    return parser.parse_args()
 
 
 def load_frames(frame_dir: str, device: str) -> torch.Tensor:
     paths = sorted(glob.glob(os.path.join(frame_dir, "frame_*.png")))
-    if not paths:
-        return None
-    imgs = []
-    for p in paths:
-        img = Image.open(p).convert("RGB")
-        t = TF.to_tensor(img)  # [3, H, W] in [0, 1]
-        imgs.append(t)
-    return torch.stack(imgs).to(device)  # [N, 3, H, W]
+    frames = []
+    for path in paths:
+        with Image.open(path) as image:
+            frames.append(TF.to_tensor(image.convert("RGB")))
+    if not frames:
+        raise ValueError(f"No frames in {frame_dir}")
+    # The lpips package expects RGB values in [-1, 1].
+    return (torch.stack(frames).to(device) * 2.0) - 1.0
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--out_root", type=str, default="./output/morphbench_sd3")
-    p.add_argument(
-        "--subsets",
-        type=str,
-        nargs="+",
-        default=["Metamorphosis", "Animation"],
-    )
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument(
-        "--topiq",
-        type=str,
-        default="topiq_nr",
-        choices=["topiq_nr", "topiq_fr"],
-        help="topiq_nr: no-reference; topiq_fr: full-reference",
-    )
-    p.add_argument(
-        "--lpips_backbone",
-        type=str,
-        default="alex",
-        choices=["alex", "vgg"],
-    )
-    return p.parse_args()
+def summarize(values: List[float]) -> Dict[str, float]:
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "n": int(array.size),
+        "mean": float(array.mean()),
+        "std": float(array.std(ddof=1)) if array.size > 1 else 0.0,
+    }
+
+
+def paired_bootstrap(
+    values_a: List[float],
+    values_b: List[float],
+    repeats: int,
+    rng: np.random.Generator,
+) -> Dict[str, float]:
+    differences = np.asarray(values_a) - np.asarray(values_b)
+    result = {
+        "n": int(differences.size),
+        "mean_difference_method_a_minus_method_b": float(differences.mean()),
+    }
+    if not differences.size or repeats <= 0:
+        return result
+    indices = rng.integers(0, differences.size, size=(repeats, differences.size))
+    estimates = differences[indices].mean(axis=1)
+    result["bootstrap_95_ci"] = [
+        float(np.quantile(estimates, 0.025)),
+        float(np.quantile(estimates, 0.975)),
+    ]
+    return result
 
 
 def main():
     args = parse_args()
-    import pyiqa
+    import lpips
 
-    print(f"Loading LPIPS (backbone={args.lpips_backbone}) and {args.topiq}...")
-    lpips = pyiqa.create_metric(
-        "lpips", net=args.lpips_backbone, as_loss=False
-    ).to(args.device)
-    topiq = pyiqa.create_metric(args.topiq).to(args.device)
+    if len(args.methods) < 2:
+        raise ValueError("Paired evaluation requires at least two methods")
+    method_a, method_b = args.methods[:2]
+
+    print(f"Loading LPIPS/{args.lpips_backbone} on {args.device}...", flush=True)
+    metric = lpips.LPIPS(net=args.lpips_backbone).eval().to(args.device)
 
     rows = []
-    per_subset = {s: {"ppl": [], "pdv": [], "topiq": []} for s in args.subsets}
-
-    for subset in args.subsets:
-        subset_dir = os.path.join(args.out_root, subset)
-        if not os.path.isdir(subset_dir):
-            print(f"[WARN] {subset_dir} not found")
-            continue
-        names = sorted(
-            d
-            for d in os.listdir(subset_dir)
-            if os.path.isdir(os.path.join(subset_dir, d, "frames"))
-        )
-        for name in names:
-            frame_dir = os.path.join(subset_dir, name, "frames")
-            frames = load_frames(frame_dir, args.device)
-            if frames is None or frames.shape[0] < 2:
-                print(f"[SKIP] {subset}/{name}: <2 frames")
+    for method in args.methods:
+        for subset in args.subsets:
+            subset_dir = os.path.join(args.out_root, method, subset)
+            if not os.path.isdir(subset_dir):
+                print(f"[WARN] Missing {subset_dir}", flush=True)
                 continue
-
-            with torch.no_grad():
-                adj = []
-                for i in range(frames.shape[0] - 1):
-                    d = lpips(frames[i : i + 1], frames[i + 1 : i + 2]).item()
-                    adj.append(d)
-                ppl = float(sum(adj))
-                pdv = float(statistics.stdev(adj)) if len(adj) > 1 else 0.0
-
-                topiq_scores = []
-                for i in range(frames.shape[0]):
-                    topiq_scores.append(topiq(frames[i : i + 1]).item())
-                topiq_mean = float(sum(topiq_scores) / len(topiq_scores))
-
-            rows.append(
-                {
+            names = sorted(
+                name
+                for name in os.listdir(subset_dir)
+                if os.path.isdir(os.path.join(subset_dir, name, "frames"))
+            )
+            for name in names:
+                frame_dir = os.path.join(subset_dir, name, "frames")
+                frames = load_frames(frame_dir, args.device)
+                if frames.shape[0] != args.expected_frames:
+                    print(
+                        f"[SKIP] {method}/{subset}/{name}: "
+                        f"{frames.shape[0]} frames, expected {args.expected_frames}",
+                        flush=True,
+                    )
+                    continue
+                with torch.inference_mode():
+                    adjacent = (
+                        metric(frames[:-1], frames[1:])
+                        .reshape(-1)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float64)
+                    )
+                row = {
+                    "method": method,
                     "subset": subset,
                     "name": name,
-                    "ppl": ppl,
-                    "pdv": pdv,
-                    "topiq": topiq_mean,
                     "n_frames": int(frames.shape[0]),
+                    "ppl": float(adjacent.sum()),
+                    "pdv_var": float(adjacent.var(ddof=0)),
+                    "pdv_std": float(adjacent.std(ddof=0)),
+                    "adjacent_lpips": adjacent.tolist(),
                 }
-            )
-            per_subset[subset]["ppl"].append(ppl)
-            per_subset[subset]["pdv"].append(pdv)
-            per_subset[subset]["topiq"].append(topiq_mean)
-            print(
-                f"  {subset}/{name:30s}  PPL={ppl:.3f}  PDV={pdv:.4f}  TOPIQ={topiq_mean:.3f}"
-            )
+                rows.append(row)
+                print(
+                    f"{method:5s} {subset:13s} {name:30s} "
+                    f"PPL={row['ppl']:.6f} PDV-var={row['pdv_var']:.8f}",
+                    flush=True,
+                )
 
-    csv_path = os.path.join(args.out_root, "metrics.csv")
-    with open(csv_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["subset", "name", "PPL", "PDV", "TOPIQ", "n_frames"])
-        for r in rows:
-            w.writerow([r["subset"], r["name"], r["ppl"], r["pdv"], r["topiq"], r["n_frames"]])
-        w.writerow([])
-        w.writerow(["--- per-subset mean ---"])
-        all_ppl, all_pdv, all_topiq = [], [], []
-        for subset, agg in per_subset.items():
-            if not agg["ppl"]:
-                continue
-            ppl_m = sum(agg["ppl"]) / len(agg["ppl"])
-            pdv_m = sum(agg["pdv"]) / len(agg["pdv"])
-            topiq_m = sum(agg["topiq"]) / len(agg["topiq"])
-            w.writerow([subset, f"(n={len(agg['ppl'])})", ppl_m, pdv_m, topiq_m, ""])
-            all_ppl.extend(agg["ppl"])
-            all_pdv.extend(agg["pdv"])
-            all_topiq.extend(agg["topiq"])
-            print(
-                f"\n{subset} mean over {len(agg['ppl'])} pairs: "
-                f"PPL={ppl_m:.3f}  PDV={pdv_m:.4f}  TOPIQ={topiq_m:.3f}"
-            )
-        if all_ppl:
-            w.writerow(
+    csv_path = os.path.join(args.out_root, "lpips_per_pair.csv")
+    os.makedirs(args.out_root, exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "method",
+                "subset",
+                "name",
+                "n_frames",
+                "PPL",
+                "PDV_variance",
+                "PDV_std",
+                "adjacent_LPIPS",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
                 [
-                    "ALL",
-                    f"(n={len(all_ppl)})",
-                    sum(all_ppl) / len(all_ppl),
-                    sum(all_pdv) / len(all_pdv),
-                    sum(all_topiq) / len(all_topiq),
-                    "",
+                    row["method"],
+                    row["subset"],
+                    row["name"],
+                    row["n_frames"],
+                    row["ppl"],
+                    row["pdv_var"],
+                    row["pdv_std"],
+                    json.dumps(row["adjacent_lpips"]),
                 ]
             )
-            print(
-                f"\nALL  mean over {len(all_ppl)} pairs: "
-                f"PPL={sum(all_ppl)/len(all_ppl):.3f}  "
-                f"PDV={sum(all_pdv)/len(all_pdv):.4f}  "
-                f"TOPIQ={sum(all_topiq)/len(all_topiq):.3f}"
+
+    grouped = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        for metric_name in ("ppl", "pdv_var", "pdv_std"):
+            grouped[(row["method"], row["subset"])][metric_name].append(
+                row[metric_name]
+            )
+            grouped[(row["method"], "ALL")][metric_name].append(row[metric_name])
+
+    summary = {
+        "definitions": {
+            "PPL": "sum of adjacent-frame LPIPS distances",
+            "PDV_variance": "population variance of adjacent-frame LPIPS distances",
+            "PDV_std": "population standard deviation of adjacent-frame LPIPS distances",
+        },
+        "expected_frames": args.expected_frames,
+        "lpips_backbone": args.lpips_backbone,
+        "groups": {},
+        "paired_comparison": {
+            "method_a": method_a,
+            "method_b": method_b,
+            "difference": "method_a minus method_b",
+            "groups": {},
+        },
+    }
+    for (method, subset), values_by_metric in sorted(grouped.items()):
+        key = f"{method}/{subset}"
+        summary["groups"][key] = {
+            metric_name: summarize(values)
+            for metric_name, values in values_by_metric.items()
+    }
+
+    rng = np.random.default_rng(args.seed)
+    rows_by_key = {
+        (row["method"], row["subset"], row["name"]): row for row in rows
+    }
+    for subset in [*args.subsets, "ALL"]:
+        if subset == "ALL":
+            pair_keys = sorted(
+                (row["subset"], row["name"])
+                for row in rows
+                if row["method"] == method_a
+                and (method_b, row["subset"], row["name"]) in rows_by_key
+            )
+        else:
+            pair_keys = sorted(
+                (row["subset"], row["name"])
+                for row in rows
+                if row["method"] == method_a
+                and row["subset"] == subset
+                and (method_b, row["subset"], row["name"]) in rows_by_key
+            )
+        summary["paired_comparison"]["groups"][subset] = {}
+        for metric_name in ("ppl", "pdv_var", "pdv_std"):
+            values_a = [
+                rows_by_key[(method_a, pair_subset, name)][metric_name]
+                for pair_subset, name in pair_keys
+            ]
+            values_b = [
+                rows_by_key[(method_b, pair_subset, name)][metric_name]
+                for pair_subset, name in pair_keys
+            ]
+            summary["paired_comparison"]["groups"][subset][metric_name] = (
+                paired_bootstrap(
+                    values_a,
+                    values_b,
+                    args.bootstrap_repeats,
+                    rng,
+                )
+                if pair_keys
+                else {"n": 0}
             )
 
-    print(f"\nSaved {csv_path}")
+    summary_path = os.path.join(args.out_root, "lpips_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    print(f"Saved {csv_path}", flush=True)
+    print(f"Saved {summary_path}", flush=True)
 
 
 if __name__ == "__main__":

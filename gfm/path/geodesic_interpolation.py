@@ -286,6 +286,11 @@ class ELInterpolator(BaseInterpolator):
         class_label: Optional[torch.Tensor] = None,
         lam: float = 1.0,
         verbose: bool = True,
+        record_per_path_residuals: bool = False,
+        fail_on_nonfinite: bool = False,
+        retract_to_sphere: bool = False,
+        sphere_radius: Optional[float] = None,
+        snapshot_iters: Optional[List[int]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Optimize geodesic on sphere with score-based force."""
@@ -305,6 +310,23 @@ class ELInterpolator(BaseInterpolator):
 
         optimizer = torch.optim.Adam([x_inner], lr=lr, eps=1e-5)
         losses = []
+        acc_norms: List[float] = []
+        f_norms: List[float] = []
+        per_path_residuals: List[torch.Tensor] = []
+        snap_set = set(snapshot_iters or [])
+        snapshots: Dict[int, torch.Tensor] = {}
+
+        if retract_to_sphere:
+            if sphere_radius is None or sphere_radius <= 0:
+                raise ValueError(
+                    "A positive sphere_radius is required when "
+                    "retract_to_sphere=True."
+                )
+
+            def retract_(points: torch.Tensor) -> None:
+                flat = points.flatten(start_dim=2)
+                norms = flat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                flat.mul_(float(sphere_radius) / norms)
 
         # Prepare expanded class labels once (for n_inner points per batch)
         if class_label is not None:
@@ -343,27 +365,105 @@ class ELInterpolator(BaseInterpolator):
                 x_inner_flat, force_euclidean
             ).view_as(x_inner)
 
+            if iteration in snap_set:
+                snapshots[iteration] = torch.cat(
+                    [x0.unsqueeze(1), x_inner.detach().clone(), x1.unsqueeze(1)],
+                    dim=1,
+                )
+
             # Loss
-            loss = ((acc_geodesic + lam * force_tangent) ** 2).mean()
+            residual = acc_geodesic + lam * force_tangent
+            per_path_loss = residual.square().flatten(start_dim=1).mean(dim=1)
+            loss = per_path_loss.mean()
+
+            with torch.no_grad():
+                acc_rms = acc_geodesic.pow(2).mean().sqrt().item()
+                f_rms = force_tangent.pow(2).mean().sqrt().item()
+            acc_norms.append(acc_rms)
+            f_norms.append(f_rms)
+
+            if record_per_path_residuals:
+                per_path_residuals.append(per_path_loss.detach().cpu())
+            if fail_on_nonfinite and not torch.isfinite(per_path_loss).all():
+                bad = (~torch.isfinite(per_path_loss)).nonzero(as_tuple=False).flatten()
+                raise FloatingPointError(
+                    f"Non-finite Euler-Lagrange residual at iteration {iteration}; "
+                    f"batch indices={bad.tolist()}"
+                )
 
             loss.backward()
+            if retract_to_sphere:
+                with torch.no_grad():
+                    tangent_grad = self.project_to_tangent_space(
+                        x_inner.reshape(-1, *x_inner.shape[2:]),
+                        x_inner.grad.reshape(-1, *x_inner.grad.shape[2:]),
+                    ).view_as(x_inner.grad)
+                    x_inner.grad.copy_(tangent_grad)
             optimizer.step()
+            if retract_to_sphere:
+                with torch.no_grad():
+                    retract_(x_inner)
             losses.append(loss.item())
 
             if verbose and iteration % 20 == 0:
-                print(f"Iter {iteration}: loss = {loss.item():.6f}")
+                lam_f_rms = lam * f_rms
+                ratio = lam_f_rms / (acc_rms + 1e-12)
+                print(
+                    f"Iter {iteration}: loss = {loss.item():.6f} | "
+                    f"||acc||={acc_rms:.4g}  ||λf||={lam_f_rms:.4g}  "
+                    f"(||f||={f_rms:.4g}, λf/acc={ratio:.3g})"
+                )
 
         final_path = torch.cat(
             [x0.unsqueeze(1), x_inner.detach(), x1.unsqueeze(1)], dim=1
         )
+        snapshots[max_iters] = final_path
 
-        return final_path, {
+        info = {
             "losses": losses,
+            "acc_norms": acc_norms,
+            "f_norms": f_norms,
             "method": "euler_lagrange",
             "sigma": sigma,
             "lambda": lam,
             "iterations": max_iters,
+            "retract_to_sphere": retract_to_sphere,
+            "sphere_radius": sphere_radius,
+            "snapshots": snapshots,
         }
+        if record_per_path_residuals:
+            # The loop records the initial residual and every pre-update residual.
+            # Recompute once after the final optimizer step so the curve contains
+            # R_0 followed by the residual after each of max_iters updates.
+            with torch.no_grad():
+                final_acc = (
+                    final_path[:, 2:]
+                    - 2 * final_path[:, 1:-1]
+                    + final_path[:, :-2]
+                ) / (dt**2)
+                final_mid = final_path[:, 1:-1].reshape(
+                    -1, *final_path.shape[2:]
+                )
+                final_acc_flat = final_acc.reshape(-1, *final_acc.shape[2:])
+                final_acc_tangent = self.project_to_tangent_space(
+                    final_mid, final_acc_flat
+                ).view_as(final_acc)
+                final_force = self.compute_force(
+                    final_mid, sigma, cls_labels_expanded
+                )
+                final_force_tangent = self.project_to_tangent_space(
+                    final_mid, final_force
+                ).view_as(final_acc)
+                final_residual = final_acc_tangent + lam * final_force_tangent
+                final_per_path = (
+                    final_residual.square().flatten(start_dim=1).mean(dim=1)
+                )
+            per_path_residuals.append(final_per_path.cpu())
+            info["per_path_residuals"] = torch.stack(
+                per_path_residuals, dim=1
+            )
+
+        return final_path, info
 
 
 class SeqELInterpolator(ELInterpolator):
@@ -1220,38 +1320,114 @@ class EL2Interpolator(BaseInterpolator):
         lam: float = 1.0,
         verbose: bool = True,
         snapshot_iters: Optional[List[int]] = None,
+        early_stop_patience: int = 0,
+        early_stop_rel_delta: float = 1e-4,
+        early_stop_warmup: int = 0,
+        initial_path: Optional[torch.Tensor] = None,
+        restore_best: bool = False,
+        trainable_indices: Optional[List[int]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Optimize geodesic on sphere with score-based force."""
+        """Optimize geodesic on sphere with score-based force.
+
+        ``trainable_indices`` contains full-path indices.  When provided, all
+        other path points are treated as fixed anchors: they are detached from
+        the optimization and their own residuals are excluded from the loss.
+        """
+        if early_stop_patience < 0:
+            raise ValueError("early_stop_patience must be non-negative")
+        if early_stop_rel_delta < 0:
+            raise ValueError("early_stop_rel_delta must be non-negative")
+        if early_stop_warmup < 0:
+            raise ValueError("early_stop_warmup must be non-negative")
+
         batch_size = start_latent.shape[0]
 
-        path = self.slerp_interpolate(start_latent, end_latent, num_steps)
+        if initial_path is None:
+            path = self.slerp_interpolate(start_latent, end_latent, num_steps)
+        else:
+            expected_shape = (
+                start_latent.shape[0],
+                num_steps,
+                *start_latent.shape[1:],
+            )
+            if tuple(initial_path.shape) != expected_shape:
+                raise ValueError(
+                    "initial_path has shape "
+                    f"{tuple(initial_path.shape)}, expected {expected_shape}"
+                )
+            path = initial_path.to(
+                device=start_latent.device,
+                dtype=start_latent.dtype,
+            ).clone()
+            path[:, 0] = start_latent
+            path[:, -1] = end_latent
 
         if num_steps <= 2:
             return path, {"losses": [], "method": "euler_lagrange"}
 
-        x0 = path[:, 0]
-        x1 = path[:, -1]
-        x_inner = path[:, 1:-1].clone().detach().requires_grad_(True)
+        if trainable_indices is None:
+            optimized_indices = list(range(1, num_steps - 1))
+        else:
+            optimized_indices = [int(index) for index in trainable_indices]
+            if optimized_indices != sorted(set(optimized_indices)):
+                raise ValueError(
+                    "trainable_indices must be strictly increasing and unique"
+                )
+            if any(
+                index <= 0 or index >= num_steps - 1
+                for index in optimized_indices
+            ):
+                raise ValueError(
+                    "trainable_indices must contain only interior path indices"
+                )
+            if not optimized_indices:
+                raise ValueError("trainable_indices must not be empty")
+
+        fixed_path = path.detach().clone()
+        fixed_path[:, 0] = start_latent
+        fixed_path[:, -1] = end_latent
+        x_trainable = (
+            fixed_path[:, optimized_indices]
+            .clone()
+            .detach()
+            .requires_grad_(True)
+        )
+
+        def assemble_path(points: torch.Tensor) -> torch.Tensor:
+            full_path = fixed_path.clone()
+            full_path[:, optimized_indices] = points
+            return full_path
 
         snap_set = set(snapshot_iters or [])
         snapshots: Dict[int, torch.Tensor] = {}
 
         dt = 1.0 / (num_steps - 1)
-        n_inner = num_steps - 2
+        n_trainable = len(optimized_indices)
+        previous_indices = [index - 1 for index in optimized_indices]
+        next_indices = [index + 1 for index in optimized_indices]
 
-        optimizer = torch.optim.Adam([x_inner], lr=lr, eps=1e-5)
+        optimizer = torch.optim.Adam([x_trainable], lr=lr, eps=1e-5)
         losses = []
         acc_norms: List[float] = []
         f_norms: List[float] = []
+        best_loss = float("inf")
+        best_iteration = -1
+        best_trainable: Optional[torch.Tensor] = None
+        stale_iterations = 0
+        early_stopped = False
 
-        # Prepare expanded class labels once (for n_inner points per batch)
+        # Prepare expanded class labels once for the optimized points.
         if class_label is not None:
             if class_label.numel() == 1:
-                cls_labels_expanded = class_label.expand(batch_size * n_inner)
+                cls_labels_expanded = class_label.expand(
+                    batch_size * n_trainable
+                )
             else:
                 cls_labels_expanded = (
-                    class_label.unsqueeze(1).expand(-1, n_inner).reshape(-1)
+                    class_label.unsqueeze(1)
+                    .expand(-1, n_trainable)
+                    .reshape(-1)
                 )
         else:
             cls_labels_expanded = None
@@ -1259,29 +1435,30 @@ class EL2Interpolator(BaseInterpolator):
         for iteration in range(max_iters):
             optimizer.zero_grad()
 
-            full_path = torch.cat([x0.unsqueeze(1), x_inner, x1.unsqueeze(1)], dim=1)
+            full_path = assemble_path(x_trainable)
 
-            # Geodesic acceleration
+            # Each optimized point uses its two neighboring anchors/points.
             acc_euclidean = (
-                full_path[:, 2:] - 2 * full_path[:, 1:-1] + full_path[:, :-2]
+                full_path[:, next_indices]
+                - 2 * full_path[:, optimized_indices]
+                + full_path[:, previous_indices]
             ) / (dt**2)
-            x_mid = full_path[:, 1:-1].reshape(-1, *full_path.shape[2:])
-            acc_flat = acc_euclidean.reshape(-1, *acc_euclidean.shape[2:])
             acc_geodesic = acc_euclidean
 
             # Reuse compute_force from BaseInterpolator
-            x_inner_flat = x_inner.reshape(-1, *x_inner.shape[2:])
+            x_trainable_flat = x_trainable.reshape(
+                -1, *x_trainable.shape[2:]
+            )
             force_euclidean = self.compute_force(
-                x_inner_flat, sigma, cls_labels_expanded
+                x_trainable_flat, sigma, cls_labels_expanded
             )
 
             # Project force to tangent space
             force_tangent = force_euclidean
 
             if iteration in snap_set:
-                snapshots[iteration] = torch.cat(
-                    [x0.unsqueeze(1), x_inner.detach().clone(), x1.unsqueeze(1)],
-                    dim=1,
+                snapshots[iteration] = assemble_path(
+                    x_trainable.detach().clone()
                 )
 
             # Loss
@@ -1293,9 +1470,26 @@ class EL2Interpolator(BaseInterpolator):
             acc_norms.append(acc_rms)
             f_norms.append(f_rms)
 
+            loss_value = loss.item()
+            losses.append(loss_value)
+
+            required_improvement = (
+                abs(best_loss) * early_stop_rel_delta
+                if np.isfinite(best_loss)
+                else 0.0
+            )
+            if loss_value < best_loss - required_improvement:
+                best_loss = loss_value
+                best_iteration = iteration
+                stale_iterations = 0
+                if early_stop_patience > 0 or restore_best:
+                    # The recorded loss corresponds to the pre-update path.
+                    best_trainable = x_trainable.detach().clone()
+            else:
+                stale_iterations += 1
+
             loss.backward()
             optimizer.step()
-            losses.append(loss.item())
 
             if verbose and iteration % 20 == 0:
                 lam_f_rms = lam * f_rms
@@ -1306,10 +1500,32 @@ class EL2Interpolator(BaseInterpolator):
                     f"(||f||={f_rms:.4g}, λf/acc={ratio:.3g})"
                 )
 
-        final_path = torch.cat(
-            [x0.unsqueeze(1), x_inner.detach(), x1.unsqueeze(1)], dim=1
-        )
-        snapshots[max_iters] = final_path
+            if (
+                early_stop_patience > 0
+                and iteration + 1 >= early_stop_warmup
+                and stale_iterations >= early_stop_patience
+            ):
+                early_stopped = True
+                if verbose:
+                    print(
+                        f"Early stopping at iter {iteration}: no relative "
+                        f"improvement >= {early_stop_rel_delta:g} for "
+                        f"{stale_iterations} iterations; best iter="
+                        f"{best_iteration}, best loss={best_loss:.6f}"
+                    )
+                break
+
+        iterations_run = len(losses)
+        if (
+            (early_stop_patience > 0 or restore_best)
+            and best_trainable is not None
+        ):
+            # Return the best observed path, not the last potentially noisy
+            # iterate.  This also applies when max_iters is reached first.
+            x_trainable = best_trainable
+
+        final_path = assemble_path(x_trainable.detach())
+        snapshots[iterations_run] = final_path
 
         return final_path, {
             "losses": losses,
@@ -1318,7 +1534,17 @@ class EL2Interpolator(BaseInterpolator):
             "method": "euler_lagrange2",
             "sigma": sigma,
             "lambda": lam,
-            "iterations": max_iters,
+            "iterations": iterations_run,
+            "max_iterations": max_iters,
+            "early_stopped": early_stopped,
+            "best_iteration": best_iteration,
+            "best_loss": best_loss,
+            "trainable_indices": optimized_indices,
+            "fixed_indices": [
+                index
+                for index in range(num_steps)
+                if index not in optimized_indices
+            ],
             "snapshots": snapshots,
         }
 

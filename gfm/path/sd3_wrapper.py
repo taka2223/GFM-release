@@ -30,6 +30,55 @@ from tqdm import tqdm
 # ============================================================
 
 
+def piecewise_slerp_resample(path: torch.Tensor, output_steps: int) -> torch.Tensor:
+    """Resample a control-point path with equal-time spherical arc segments."""
+    if path.ndim < 3:
+        raise ValueError("path must have shape [batch, steps, ...]")
+    control_steps = path.shape[1]
+    if control_steps < 2:
+        raise ValueError("path must contain at least two control points")
+    if output_steps < 2:
+        raise ValueError("output_steps must be at least two")
+    if output_steps == control_steps:
+        return path
+
+    positions = torch.linspace(
+        0,
+        control_steps - 1,
+        output_steps,
+        device=path.device,
+        dtype=path.dtype,
+    )
+    left = positions.floor().long().clamp(max=control_steps - 2)
+    alpha = (positions - left.to(positions.dtype)).view(
+        1, output_steps, *([1] * (path.ndim - 2))
+    )
+
+    point_left = path[:, left]
+    point_right = path[:, left + 1]
+    flat_left = point_left.flatten(start_dim=2)
+    flat_right = point_right.flatten(start_dim=2)
+    norm_left = flat_left.norm(dim=-1, keepdim=True)
+    norm_right = flat_right.norm(dim=-1, keepdim=True)
+    cosine = (
+        (flat_left * flat_right).sum(dim=-1, keepdim=True)
+        / (norm_left * norm_right + 1e-8)
+    ).clamp(-1 + 1e-7, 1 - 1e-7)
+    omega = torch.acos(cosine)
+    sin_omega = torch.sin(omega)
+
+    alpha_flat = alpha.flatten(start_dim=2)
+    weight_left = torch.sin((1 - alpha_flat) * omega) / (sin_omega + 1e-8)
+    weight_right = torch.sin(alpha_flat * omega) / (sin_omega + 1e-8)
+    small_angle = sin_omega.abs() < 1e-6
+    weight_left = torch.where(small_angle, 1 - alpha_flat, weight_left)
+    weight_right = torch.where(small_angle, alpha_flat, weight_right)
+    output_flat = weight_left * flat_left + weight_right * flat_right
+    return output_flat.view(
+        path.shape[0], output_steps, *path.shape[2:]
+    )
+
+
 class BLIPCaptioner:
     def __init__(
         self,
@@ -110,7 +159,7 @@ class SD3Model(torch.nn.Module):
         self._embedB = None
         self._pooledA = None
         self._pooledB = None
-        self._num_steps = None
+        self._waypoint_fractions = None
 
     def _encode_prompt(self, prompt: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode prompt with SD3's text encoders (CLIP-L + OpenCLIP-G, optionally T5).
@@ -141,15 +190,50 @@ class SD3Model(torch.nn.Module):
         self.cfg_scale = cfg_scale
 
     def set_endpoints(
-        self, embedA, pooledA, embedB, pooledB, sigma: float, num_steps: int
+        self,
+        embedA,
+        pooledA,
+        embedB,
+        pooledB,
+        sigma: float,
+        num_steps: Optional[int] = None,
+        waypoint_indices: Optional[List[int]] = None,
+        denominator: Optional[int] = None,
     ):
-        """Set endpoints for GFM dynamic embedding interpolation."""
+        """Set endpoints and exact full-path indices used by the solver.
+
+        ``num_steps`` remains accepted for older callers.  New optimization
+        code passes ``waypoint_indices`` explicitly so a frozen-anchor C2F
+        stage cannot silently fall back to midpoint conditioning.
+        """
+        if waypoint_indices is None:
+            if num_steps is None:
+                raise ValueError("num_steps or waypoint_indices is required")
+            waypoint_indices = list(range(1, num_steps - 1))
+            denominator = num_steps - 1
+        if denominator is None or denominator < 1:
+            raise ValueError("conditioning denominator must be positive")
+        if (
+            not waypoint_indices
+            or waypoint_indices != sorted(set(waypoint_indices))
+            or any(index <= 0 or index >= denominator for index in waypoint_indices)
+        ):
+            raise ValueError(
+                "waypoint_indices must be unique, increasing interior indices"
+            )
         self._embedA = embedA
         self._pooledA = pooledA
         self._embedB = embedB
         self._pooledB = pooledB
         self._sigma = sigma
-        self._num_steps = num_steps
+        self._waypoint_fractions = (
+            torch.tensor(
+                waypoint_indices,
+                device=self.device,
+                dtype=embedA.dtype,
+            )
+            / float(denominator)
+        )
         self._embeds_cond = None
 
     def _v_pred(
@@ -190,25 +274,17 @@ class SD3Model(torch.nn.Module):
 
         # --- Resolve conditioning ---
         if self._embedA is not None:
-            n_inner = self._num_steps - 2
-            if n_inner > 0 and batch_size % n_inner == 0:
-                B = batch_size // n_inner
-                s = torch.linspace(
-                    1.0 / (self._num_steps - 1),
-                    float(n_inner) / (self._num_steps - 1),
-                    n_inner,
-                    device=self.device,
+            waypoint_count = int(self._waypoint_fractions.numel())
+            if batch_size % waypoint_count:
+                raise ValueError(
+                    "model batch does not match explicit waypoint conditioning: "
+                    f"batch={batch_size}, waypoint_count={waypoint_count}"
                 )
-                s = s.repeat(B)
-                s_emb = s.view(-1, 1, 1)
-                embeds = (1.0 - s_emb) * self._embedA + s_emb * self._embedB
-                s_pool = s.view(-1, 1)
-                pooled = (1.0 - s_pool) * self._pooledA + s_pool * self._pooledB
-            else:
-                embeds = (0.5 * (self._embedA + self._embedB)).expand(
-                    batch_size, -1, -1
-                )
-                pooled = (0.5 * (self._pooledA + self._pooledB)).expand(batch_size, -1)
+            s = self._waypoint_fractions.repeat(batch_size // waypoint_count)
+            s_emb = s.view(-1, 1, 1)
+            embeds = (1.0 - s_emb) * self._embedA + s_emb * self._embedB
+            s_pool = s.view(-1, 1)
+            pooled = (1.0 - s_pool) * self._pooledA + s_pool * self._pooledB
         elif self._embeds_cond is not None:
             embeds = self._embeds_cond.expand(batch_size, -1, -1)
             pooled = self._pooled_cond.expand(batch_size, -1)
@@ -338,8 +414,10 @@ class SD3GFMPipeline:
         dtype=torch.float16,
         cache_dir: Optional[str] = None,
         load_blip: bool = True,
+        caption_model_id: str = "Salesforce/blip-image-captioning-large",
         resolution: int = 1024,
         drop_t5: bool = True,
+        n_inference_steps: int = 50,
     ) -> "SD3GFMPipeline":
         """Load SD3 pipeline.
 
@@ -357,9 +435,20 @@ class SD3GFMPipeline:
         )
         pipe.to(device)
         captioner = (
-            BLIPCaptioner(device=device, cache_dir=cache_dir) if load_blip else None
+            BLIPCaptioner(
+                model_id=caption_model_id,
+                device=device,
+                cache_dir=cache_dir,
+            )
+            if load_blip
+            else None
         )
-        return cls(pipe, captioner=captioner, resolution=resolution)
+        return cls(
+            pipe,
+            n_inference_steps=n_inference_steps,
+            captioner=captioner,
+            resolution=resolution,
+        )
 
     def auto_caption(self, image: Image.Image) -> str:
         return self.captioner.caption(image)
@@ -533,6 +622,15 @@ def run_gfm_interpolation(
     mode: str = "nfsd",
     snapshot_iters: Optional[List[int]] = None,
     method: str = "gfm",
+    cond_seed: int = 20260727,
+    opt_num_steps: Optional[int] = None,
+    early_stop_patience: int = 0,
+    early_stop_rel_delta: float = 1e-4,
+    early_stop_warmup: int = 0,
+    c2f_steps: Optional[List[int]] = None,
+    c2f_iters: Optional[List[int]] = None,
+    c2f_lrs: Optional[List[float]] = None,
+    c2f_freeze_anchors: bool = False,
 ) -> Dict[str, Any]:
     from gfm.path.geodesic_interpolation import (
         ELInterpolator,
@@ -543,6 +641,40 @@ def run_gfm_interpolation(
 
     device = sd3_pipe.device
     output_frames = num_steps
+    is_coarse_to_fine = method == "gfm_c2f"
+    if is_coarse_to_fine:
+        c2f_steps = c2f_steps or [3, 5, 9, output_frames]
+        c2f_iters = c2f_iters or [400, 300, 200, 100]
+        c2f_lrs = c2f_lrs or [0.002, 0.001, 0.0005, 0.00025]
+        if not (len(c2f_steps) == len(c2f_iters) == len(c2f_lrs)):
+            raise ValueError("c2f_steps, c2f_iters, and c2f_lrs must have equal length")
+        if not c2f_steps:
+            raise ValueError("coarse-to-fine schedule must contain at least one stage")
+        if c2f_steps != sorted(set(c2f_steps)):
+            raise ValueError("c2f_steps must be strictly increasing")
+        if c2f_steps[0] < 3 or c2f_steps[-1] > output_frames:
+            raise ValueError("c2f_steps must lie between three and the output frame count")
+        if any(iterations < 1 for iterations in c2f_iters):
+            raise ValueError("every coarse-to-fine stage needs at least one iteration")
+        if any(stage_lr <= 0 for stage_lr in c2f_lrs):
+            raise ValueError("every coarse-to-fine learning rate must be positive")
+        if c2f_freeze_anchors:
+            for previous_steps, current_steps in zip(
+                c2f_steps[:-1], c2f_steps[1:]
+            ):
+                if (current_steps - 1) % (previous_steps - 1) != 0:
+                    raise ValueError(
+                        "anchor-frozen C2F requires nested grids: each "
+                        "(current_steps - 1) must be divisible by "
+                        "(previous_steps - 1)"
+                    )
+        optimization_steps = c2f_steps[-1]
+    else:
+        optimization_steps = opt_num_steps or num_steps
+    if optimization_steps < 3:
+        raise ValueError("opt_num_steps must be at least three")
+    if optimization_steps > output_frames:
+        raise ValueError("opt_num_steps cannot exceed the number of output frames")
     sd3_pipe.model.mode = mode
 
     # 1. Caption
@@ -569,39 +701,162 @@ def run_gfm_interpolation(
         embedA, pooledA = sd3_pipe.encode_prompt(promptA)
         embedB, pooledB = sd3_pipe.encode_prompt(promptB)
 
+    if method == "cond_interp":
+        # Pure condition-interpolation baseline.  Every frame starts from the
+        # same Gaussian latent, so the only quantity changing across the strip
+        # is the linearly interpolated text conditioning.
+        fractions = torch.linspace(
+            0,
+            1,
+            num_steps,
+            device=device,
+            dtype=embedA.dtype,
+        )
+        embed_weights = fractions.view(num_steps, 1, 1)
+        pooled_weights = fractions.view(num_steps, 1)
+        frame_embeds = (1 - embed_weights) * embedA + embed_weights * embedB
+        frame_pooled = (1 - pooled_weights) * pooledA + pooled_weights * pooledB
+
+        generator = torch.Generator(device=device).manual_seed(cond_seed)
+        shared_noise = torch.randn(
+            latA.shape,
+            generator=generator,
+            device=device,
+            dtype=latA.dtype,
+        )
+        frame_noise = shared_noise.repeat(num_steps, 1, 1, 1)
+        print(
+            f"Generating from interpolated condition embeddings "
+            f"(shared noise seed={cond_seed}, CFG={cfg_scale})..."
+        )
+        frame_clean = sd3_pipe.flow_backward(
+            frame_noise,
+            frame_embeds,
+            frame_pooled,
+            noise_level=1.0,
+            cfg_scale=cfg_scale,
+        )
+        images = [
+            sd3_pipe.autoencoder.decode(frame_clean[index : index + 1])
+            for index in tqdm(range(num_steps), desc="Decoding[cond_interp]")
+        ]
+        return {
+            "images": images,
+            "latents_noisy": frame_noise.unsqueeze(0),
+            "latents_clean": frame_clean,
+            "losses": [],
+            "acc_norms": [],
+            "f_norms": [],
+            "lam": lam,
+            "sphere_radius": shared_noise.flatten().norm().item(),
+            "sigma_eff": 1.0,
+            "promptA": promptA,
+            "promptB": promptB,
+            "snapshots": {},
+            "iterations_run": 0,
+            "early_stopped": False,
+            "best_iteration": None,
+            "best_loss": None,
+        }
+
     # 4. Forward inversion
     print(f"Flow forward inversion (noise_level={noise_level})...")
-    latA_noisy = sd3_pipe.flow_forward(latA, embedA, pooledA, noise_level, cfg_scale)
-    latB_noisy = sd3_pipe.flow_forward(latB, embedB, pooledB, noise_level, cfg_scale)
+    # Both endpoints use the same ODE schedule, so invert them in one batch.
+    endpoint_noisy = sd3_pipe.flow_forward(
+        torch.cat([latA, latB], dim=0),
+        torch.cat([embedA, embedB], dim=0),
+        torch.cat([pooledA, pooledB], dim=0),
+        noise_level,
+        cfg_scale,
+    )
+    latA_noisy = endpoint_noisy[0:1]
+    latB_noisy = endpoint_noisy[1:2]
 
     normA = latA_noisy.view(-1).norm().item()
     normB = latB_noisy.view(-1).norm().item()
     sphere_radius = 0.5 * (normA + normB)
     print(f"Sphere radius: {sphere_radius:.2f}")
 
-    # latA_noisy = SD3GFMPipeline.project_to_sphere(latA_noisy, sphere_radius)
-    # latB_noisy = SD3GFMPipeline.project_to_sphere(latB_noisy, sphere_radius)
-
     # 5. Configure GFM
     sigma_eff = sd3_pipe.get_sigma_from_noise_level(noise_level)
     print(f"Effective flow time σ = {sigma_eff:.4f}")
 
-    sd3_pipe.model.set_endpoints(embedA, pooledA, embedB, pooledB, sigma_eff, num_steps)
+    if not is_coarse_to_fine:
+        sd3_pipe.model.set_endpoints(
+            embedA,
+            pooledA,
+            embedB,
+            pooledB,
+            sigma_eff,
+            waypoint_indices=list(range(1, optimization_steps - 1)),
+            denominator=optimization_steps - 1,
+        )
     sd3_pipe.model.set_cfg_params(cfg_scale)
 
     # from gfm.path.diag import ScoreDiagnostics
     # diag = ScoreDiagnostics(sd3_pipe)
     # diag.run_all(latA_noisy, latB_noisy, sigma_eff)
     # 6. Path construction (GFM optimization or SLERP baseline)
+    optimize_start = latA_noisy
+    optimize_end = latB_noisy
+    optimize_kwargs: Dict[str, Any] = {}
+
     if method == "slerp":
-        print(f"Running SLERP baseline (steps={num_steps}, no optimization)...")
+        print(
+            f"Running SLERP baseline (control steps={optimization_steps}, "
+            f"output frames={output_frames}, no optimization)..."
+        )
         interpolator = SphericalInterpolator(
             diffusion_model=sd3_pipe.model,
             autoencoder=sd3_pipe.autoencoder,
             device=str(device),
         )
+    elif method == "gfm_c2f":
+        schedule_text = ", ".join(
+            f"{steps}x{iterations}@{stage_lr:g}"
+            for steps, iterations, stage_lr in zip(
+                c2f_steps, c2f_iters, c2f_lrs
+            )
+        )
+        print(
+            f"Running {'anchor-frozen ' if c2f_freeze_anchors else ''}"
+            f"coarse-to-fine ambient GFM ({schedule_text}, "
+            f"output frames={output_frames}, λ={lam})..."
+        )
+        interpolator = EL2Interpolator(
+            diffusion_model=sd3_pipe.model,
+            autoencoder=sd3_pipe.autoencoder,
+            device=str(device),
+        )
+    elif method == "gfm_sphere":
+        # Use a genuine spherical solve: equal-radius endpoints, tangent
+        # acceleration/force, tangent gradients, and per-update retraction.
+        optimize_start = SD3GFMPipeline.project_to_sphere(
+            latA_noisy, sphere_radius
+        )
+        optimize_end = SD3GFMPipeline.project_to_sphere(
+            latB_noisy, sphere_radius
+        )
+        optimize_kwargs = {
+            "retract_to_sphere": True,
+            "sphere_radius": sphere_radius,
+        }
+        print(
+            f"Running spherical GFM (control steps={optimization_steps}, "
+            f"output frames={output_frames}, λ={lam}, "
+            f"iters={max_iters}, radius={sphere_radius:.2f})..."
+        )
+        interpolator = ELInterpolator(
+            diffusion_model=sd3_pipe.model,
+            autoencoder=sd3_pipe.autoencoder,
+            device=str(device),
+        )
     else:
-        print(f"Running GFM (steps={num_steps}, λ={lam}, iters={max_iters})...")
+        print(
+            f"Running ambient GFM (control steps={optimization_steps}, "
+            f"output frames={output_frames}, λ={lam}, "
+            f"iters={max_iters})..."
+        )
         interpolator = EL2Interpolator(
             diffusion_model=sd3_pipe.model,
             autoencoder=sd3_pipe.autoencoder,
@@ -614,65 +869,211 @@ def run_gfm_interpolation(
     #     device=str(device),
     # )
 
-    optimized_path, info = interpolator.optimize_path(
-        start_latent=latA_noisy,
-        end_latent=latB_noisy,
-        num_steps=num_steps,
-        sigma=sigma_eff,
-        lr=lr,
-        max_iters=max_iters,
-        lam=lam,
-        verbose=True,
-        init_with_slerp=False,
-        snapshot_iters=snapshot_iters,
-    )
+    def _project_control_path(path: torch.Tensor) -> torch.Tensor:
+        projected = path.clone()
+        for path_index in range(projected.shape[1]):
+            projected[:, path_index] = SD3GFMPipeline.project_to_sphere(
+                projected[:, path_index], sphere_radius
+            )
+        return projected
+
+    if is_coarse_to_fine:
+        stage_path: Optional[torch.Tensor] = None
+        stage_summaries: List[Dict[str, Any]] = []
+        combined_losses: List[float] = []
+        combined_acc_norms: List[float] = []
+        combined_f_norms: List[float] = []
+        final_stage_info: Dict[str, Any] = {}
+        previous_stage_steps: Optional[int] = None
+
+        for stage_index, (stage_steps, stage_iters, stage_lr) in enumerate(
+            zip(c2f_steps, c2f_iters, c2f_lrs), start=1
+        ):
+            initial_path = None
+            anchor_indices: List[int] = [0, stage_steps - 1]
+            trainable_indices: Optional[List[int]] = None
+            if stage_path is not None:
+                initial_path = piecewise_slerp_resample(
+                    _project_control_path(stage_path),
+                    stage_steps,
+                )
+                if c2f_freeze_anchors:
+                    refinement = (stage_steps - 1) // (
+                        previous_stage_steps - 1
+                    )
+                    anchor_indices = [
+                        index * refinement
+                        for index in range(previous_stage_steps)
+                    ]
+                    trainable_indices = [
+                        index
+                        for index in range(1, stage_steps - 1)
+                        if index not in anchor_indices
+                    ]
+            active_indices = (
+                list(range(1, stage_steps - 1))
+                if trainable_indices is None
+                else trainable_indices
+            )
+            sd3_pipe.model.set_endpoints(
+                embedA,
+                pooledA,
+                embedB,
+                pooledB,
+                sigma_eff,
+                waypoint_indices=active_indices,
+                denominator=stage_steps - 1,
+            )
+            print(
+                f"C2F stage {stage_index}/{len(c2f_steps)}: "
+                f"steps={stage_steps}, iters={stage_iters}, lr={stage_lr:g}, "
+                f"trainable={stage_steps - 2 if trainable_indices is None else len(trainable_indices)}, "
+                f"anchors={len(anchor_indices)}"
+            )
+            stage_path, stage_info = interpolator.optimize_path(
+                start_latent=optimize_start,
+                end_latent=optimize_end,
+                num_steps=stage_steps,
+                sigma=sigma_eff,
+                lr=stage_lr,
+                max_iters=stage_iters,
+                lam=lam,
+                verbose=True,
+                initial_path=initial_path,
+                restore_best=True,
+                early_stop_patience=0,
+                trainable_indices=trainable_indices,
+            )
+            anchor_drift = 0.0
+            if c2f_freeze_anchors and initial_path is not None:
+                expected_path = initial_path.clone()
+                expected_path[:, 0] = optimize_start
+                expected_path[:, -1] = optimize_end
+                anchor_drift = (
+                    stage_path[:, anchor_indices]
+                    - expected_path[:, anchor_indices]
+                ).abs().max().item()
+                if anchor_drift != 0.0:
+                    raise RuntimeError(
+                        "Frozen C2F anchors changed during optimization: "
+                        f"max absolute drift={anchor_drift:.6g}"
+                    )
+            stage_losses = stage_info.get("losses", [])
+            combined_losses.extend(stage_losses)
+            combined_acc_norms.extend(stage_info.get("acc_norms", []))
+            combined_f_norms.extend(stage_info.get("f_norms", []))
+            stage_summaries.append(
+                {
+                    "stage": stage_index,
+                    "num_steps": stage_steps,
+                    "max_iters": stage_iters,
+                    "lr": stage_lr,
+                    "iterations_run": stage_info.get("iterations", stage_iters),
+                    "initial_loss": stage_losses[0] if stage_losses else None,
+                    "last_loss": stage_losses[-1] if stage_losses else None,
+                    "best_iteration": stage_info.get("best_iteration"),
+                    "best_loss": stage_info.get("best_loss"),
+                    "trainable_indices": stage_info.get("trainable_indices"),
+                    "conditioning_fractions": [
+                        index / (stage_steps - 1) for index in active_indices
+                    ],
+                    "anchor_indices": anchor_indices,
+                    "max_anchor_drift": anchor_drift,
+                }
+            )
+            final_stage_info = stage_info
+            previous_stage_steps = stage_steps
+
+        optimized_path = stage_path
+        info = {
+            "losses": combined_losses,
+            "acc_norms": combined_acc_norms,
+            "f_norms": combined_f_norms,
+            "method": "euler_lagrange2_coarse_to_fine",
+            "sigma": sigma_eff,
+            "lambda": lam,
+            "iterations": sum(
+                summary["iterations_run"] for summary in stage_summaries
+            ),
+            "early_stopped": False,
+            "best_iteration": final_stage_info.get("best_iteration"),
+            "best_loss": final_stage_info.get("best_loss"),
+            "snapshots": {},
+            "c2f_stages": stage_summaries,
+            "c2f_freeze_anchors": c2f_freeze_anchors,
+        }
+    else:
+        optimized_path, info = interpolator.optimize_path(
+            start_latent=optimize_start,
+            end_latent=optimize_end,
+            num_steps=optimization_steps,
+            sigma=sigma_eff,
+            lr=lr,
+            max_iters=max_iters,
+            lam=lam,
+            verbose=True,
+            init_with_slerp=False,
+            snapshot_iters=snapshot_iters,
+            early_stop_patience=early_stop_patience,
+            early_stop_rel_delta=early_stop_rel_delta,
+            early_stop_warmup=early_stop_warmup,
+            **optimize_kwargs,
+        )
 
     def _project_and_decode(path: torch.Tensor, label: str):
-        path = path.clone()
-        T = path.shape[1]
-        for t in range(T):
-            path[:, t] = SD3GFMPipeline.project_to_sphere(path[:, t], sphere_radius)
+        path = _project_control_path(path)
 
-        if output_frames != num_steps:
-            t_out = torch.linspace(0, 1, output_frames, device=device)
-            t_orig = torch.linspace(0, 1, num_steps, device=device)
-            indices = torch.searchsorted(t_orig, t_out).clamp(0, num_steps - 1)
-            latents_noisy = path[:, indices]
+        if output_frames != path.shape[1]:
+            latents_noisy = piecewise_slerp_resample(path, output_frames)
         else:
             latents_noisy = path
 
         n_frames = latents_noisy.shape[1]
-        print(f"Flow backward [{label}] ({n_frames} frames)...")
-        latents_clean, images = [], []
-        for t_idx in tqdm(range(n_frames), desc=f"Denoising[{label}]"):
-            t_frac = t_idx / (n_frames - 1)
-            embed_t = (1 - t_frac) * embedA + t_frac * embedB
-            pooled_t = (1 - t_frac) * pooledA + t_frac * pooledB
+        print(f"Flow backward [{label}] ({n_frames} frames, batched)...")
+        latents_clean = [latA]
+        images = [imgA]
 
-            if t_idx == 0:
-                images.append(imgA)
-                latents_clean.append(latA)
-                continue
-            elif t_idx == n_frames - 1:
-                images.append(imgB)
-                latents_clean.append(latB)
-                continue
-
-            lat_clean = sd3_pipe.flow_backward(
-                latents_noisy[:, t_idx], embed_t, pooled_t, noise_level, cfg_scale
+        n_inner = n_frames - 2
+        if n_inner > 0:
+            fractions = torch.linspace(
+                1.0 / (n_frames - 1),
+                (n_frames - 2.0) / (n_frames - 1),
+                n_inner,
+                device=device,
+                dtype=embedA.dtype,
             )
-            latents_clean.append(lat_clean)
-            images.append(sd3_pipe.autoencoder.decode(lat_clean))
+            embed_weights = fractions.view(n_inner, 1, 1)
+            pooled_weights = fractions.view(n_inner, 1)
+            inner_embeds = (1 - embed_weights) * embedA + embed_weights * embedB
+            inner_pooled = (1 - pooled_weights) * pooledA + pooled_weights * pooledB
+            inner_noisy = latents_noisy[:, 1:-1].reshape(
+                n_inner, *latents_noisy.shape[2:]
+            )
+            inner_clean = sd3_pipe.flow_backward(
+                inner_noisy,
+                inner_embeds,
+                inner_pooled,
+                noise_level,
+                cfg_scale,
+            )
+            for index in tqdm(range(n_inner), desc=f"Decoding[{label}]"):
+                latent = inner_clean[index : index + 1]
+                latents_clean.append(latent)
+                images.append(sd3_pipe.autoencoder.decode(latent))
+
+        images.append(imgB)
+        latents_clean.append(latB)
         return images, latents_noisy, latents_clean
 
+    final_iteration = info.get("iterations", max_iters)
     output_images, output_latents_noisy, output_latents_clean = _project_and_decode(
-        optimized_path, f"iter{max_iters}"
+        optimized_path, f"iter{final_iteration}"
     )
 
     snapshots_out: Dict[int, List[Image.Image]] = {}
     raw_snapshots = info.get("snapshots", {}) or {}
     for it in sorted(raw_snapshots.keys()):
-        if it == max_iters:
+        if it == final_iteration:
             snapshots_out[it] = output_images
             continue
         imgs, _, _ = _project_and_decode(raw_snapshots[it], f"iter{it}")
@@ -691,6 +1092,12 @@ def run_gfm_interpolation(
         "promptA": promptA,
         "promptB": promptB,
         "snapshots": snapshots_out,
+        "iterations_run": final_iteration,
+        "early_stopped": info.get("early_stopped", False),
+        "best_iteration": info.get("best_iteration"),
+        "best_loss": info.get("best_loss"),
+        "c2f_stages": info.get("c2f_stages"),
+        "c2f_freeze_anchors": info.get("c2f_freeze_anchors", False),
     }
 
 
@@ -858,6 +1265,7 @@ if __name__ == "__main__":
         load_blip=not args.no_blip,
         resolution=args.resolution,
         drop_t5=not args.keep_t5,
+        n_inference_steps=args.n_inference_steps,
     )
 
     imgA = Image.open(args.imgA)
